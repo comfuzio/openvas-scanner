@@ -5,7 +5,7 @@ use std::{
     time::Duration,
 };
 
-use super::{mtu, network_utils::bind_local_socket};
+use super::{mtu, network_utils::bind_local_socket, socket::SocketError};
 
 pub struct UdpConnection {
     socket: UdpSocket,
@@ -69,10 +69,25 @@ impl Write for UdpConnection {
 }
 
 impl UdpConnection {
-    pub fn new(addr: IpAddr, port: u16) -> io::Result<Self> {
+    pub fn new(addr: IpAddr, port: u16) -> Result<Self, SocketError> {
         let sock_addr = SocketAddr::new(addr, port);
         let socket = bind_local_socket(&sock_addr)?;
         socket.connect(sock_addr)?;
+        socket.set_read_timeout(Some(Duration::from_secs(1)))?;
+        Ok(Self {
+            socket,
+            buffer: vec![],
+            flags: None,
+        })
+    }
+
+    pub fn new_priv(addr: IpAddr, sport: u16, dport: u16) -> io::Result<Self> {
+        let sock_addr = SocketAddr::new(addr, sport);
+        let socket = match sock_addr {
+            SocketAddr::V4(_) => UdpSocket::bind(format!("0.0.0.0:{}", sport)),
+            SocketAddr::V6(_) => UdpSocket::bind(format!("[::]:{}", sport)),
+        }?;
+        socket.connect(SocketAddr::new(addr, dport))?;
         socket.set_read_timeout(Some(Duration::from_secs(1)))?;
         Ok(Self {
             socket,
