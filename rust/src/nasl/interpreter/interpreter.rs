@@ -137,10 +137,10 @@ impl<'a> Interpreter<'a> {
         Some(self)
     }
 
-    async fn execute_statements<'b>(
+    async fn execute_statements(
         &self,
         key: &str,
-        inter: &mut Interpreter<'b>,
+        inter: &mut Interpreter<'_>,
         stmt: Result<Statement, SyntaxError>,
     ) -> InterpretResult {
         match stmt {
@@ -241,13 +241,6 @@ impl<'a> Interpreter<'a> {
     /// Interprets a Statement
     pub(crate) async fn resolve(&mut self, statement: &Statement) -> InterpretResult {
         self.position_mut().up();
-        let span = tracing::span!(tracing::Level::WARN, "resolve", 
-            statement=statement.to_string(),
-            index=self.index,
-            position=%self.position(),
-            run_specific_len=self.run_specific.len(),
-            skipped_value_pos=?self.skip_until_return(), );
-        let _enter = span.enter();
         if let Some(val) = self.may_return_value() {
             tracing::trace!(returns=?val, "skipped" );
             self.position_mut().down();

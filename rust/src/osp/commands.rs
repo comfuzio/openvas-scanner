@@ -188,7 +188,12 @@ fn write_scanner_prefs(scan: &Scan, writer: &mut Writer) -> Result<()> {
     writer.write_event(Event::Start(BytesStart::new("scanner_params")))?;
     for p in &scan.scan_preferences {
         writer.write_event(Event::Start(BytesStart::new(&p.id)))?;
-        writer.write_event(Event::Text(BytesText::new(&p.value)))?;
+        let value = match p.value.as_ref() {
+            "yes" => "1",
+            "no" => "0",
+            v => v,
+        };
+        writer.write_event(Event::Text(BytesText::new(value)))?;
         writer.write_event(Event::End(BytesEnd::new(&p.id)))?;
     }
 
@@ -207,7 +212,10 @@ fn write_int_element(writer: &mut Writer, name: &str, value: i64) -> Result<()> 
         Event::Text(BytesText::new(&value.to_string())),
     )
 }
-fn write_event<'a, E: AsRef<Event<'a>>>(name: &str, writer: &mut Writer, event: E) -> Result<()> {
+fn write_event<'a, E: AsRef<Event<'a>>>(name: &str, writer: &mut Writer, event: E) -> Result<()>
+where
+    quick_xml::events::Event<'a>: From<E>,
+{
     writer.write_event(Event::Start(BytesStart::new(name)))?;
     writer.write_event(event)?;
     writer.write_event(Event::End(BytesEnd::new(name)))?;
