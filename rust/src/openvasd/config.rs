@@ -2,14 +2,17 @@
 //
 // SPDX-License-Identifier: GPL-2.0-or-later WITH x11vnc-openssl-exception
 
+use scannerlib::models::PreferenceValue;
+use scannerlib::scanner::preferences::preference::{PREFERENCES, ScanPrefValue};
 use std::{
+    collections::HashMap,
     fmt::{self, Display, Formatter},
     net::SocketAddr,
     path::PathBuf,
     time::Duration,
 };
 
-use clap::{builder::TypedValueParser, ArgAction};
+use clap::{ArgAction, builder::TypedValueParser};
 use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
@@ -58,6 +61,8 @@ pub struct Scanner {
     pub scanner_type: ScannerType,
     #[serde(default)]
     pub ospd: OspdWrapper,
+    #[serde(default)]
+    pub preferences: HashMap<String, ScanPrefValue>,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
@@ -199,6 +204,8 @@ impl TypedValueParser for Mode {
 pub struct Endpoints {
     pub enable_get_scans: bool,
     #[serde(default)]
+    pub enable_get_performance: Option<bool>,
+    #[serde(default)]
     pub key: Option<String>,
 }
 
@@ -315,17 +322,32 @@ impl Display for Config {
 }
 
 impl Config {
+    fn read_to_string<P>(path: P) -> String
+    where
+        P: AsRef<std::path::Path> + std::fmt::Display + std::fmt::Debug,
+    {
+        std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("Failed to read openvasd config from file: {path:?}. {e}"))
+    }
+
     fn load_etc() -> Option<Self> {
-        let config = std::fs::read_to_string("/etc/openvasd/openvasd.toml").unwrap_or_default();
-        toml::from_str(&config).ok()
+        let path = "/etc/openvasd/openvasd.toml";
+        if !std::fs::exists(path).unwrap_or_default() {
+            return None;
+        }
+        let config = Self::read_to_string(path);
+        toml::from_str(&config).unwrap()
     }
 
     fn load_user() -> Option<Self> {
         match std::env::var("HOME") {
             Ok(home) => {
                 let path = format!("{}/.config/openvasd/openvasd.toml", home);
-                let config = std::fs::read_to_string(path).unwrap_or_default();
-                toml::from_str(&config).ok()
+                if !std::fs::exists(&path).unwrap_or_default() {
+                    return None;
+                }
+                let config = Self::read_to_string(path);
+                toml::from_str(&config).unwrap()
             }
             Err(_) => None,
         }
@@ -335,13 +357,26 @@ impl Config {
     where
         P: AsRef<std::path::Path> + std::fmt::Display + std::fmt::Debug,
     {
-        let config = std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("Failed to read openvasd config from file: {path:?}. {e}"));
+        let config = std::fs::read_to_string(path).unwrap();
+
         toml::from_str(&config).unwrap()
     }
 
+    fn ret_pref_value_or_panic_with_wrong_type(
+        p: &ScanPrefValue,
+        expected: &str,
+        name: &str,
+    ) -> ScanPrefValue {
+        match (p, expected) {
+            (ScanPrefValue::Bool(_), "bool") => p.clone(),
+            (ScanPrefValue::Int(_), "int") => p.clone(),
+            (ScanPrefValue::String(_), "string") => p.clone(),
+            _ => panic!("Wrong value type. Expected {} for {}", expected, name),
+        }
+    }
+
     pub fn load() -> Self {
-        let cmds = clap::Command::new("openvasd")
+        let mut cmds = clap::Command::new("openvasd")
             .arg(
                 clap::Arg::new("config")
                     .short('c')
@@ -427,6 +462,15 @@ impl Config {
                     .value_parser(clap::builder::BoolValueParser::new())
                     .default_missing_value("true")
                     .help("enable get scans endpoint. Default 'true'."),
+            )
+            .arg(
+                clap::Arg::new("enable-get-performance")
+                    .env("ENABLE_GET_PERFORMANCE")
+                    .long("enable-get-performance")
+                    .num_args(0..=1)
+                    .value_parser(clap::builder::BoolValueParser::new())
+                    .default_missing_value("false")
+                    .help("enable get performance endpoint. Default 'false'."),
             )
             .arg(
                 clap::Arg::new("api-key")
@@ -542,8 +586,19 @@ impl Config {
                     .value_name("service,service_notus")
                     .value_parser(Mode::Service)
                     .help("Sets the openvasd mode"),
-            )
-            .get_matches();
+            );
+
+        for pref in PREFERENCES {
+            let mut arg = clap::Arg::new(pref.id).long(pref.id).help(pref.description);
+            arg = match pref.default {
+                PreferenceValue::Bool(_) => arg.value_parser(clap::builder::BoolValueParser::new()),
+                PreferenceValue::String(_) => arg.value_parser(clap::value_parser!(String)),
+                PreferenceValue::Int(_) => arg.value_parser(clap::value_parser!(i64)),
+            };
+            cmds = cmds.arg(arg);
+        }
+
+        let cmds = cmds.get_matches();
         let mut config = match cmds.get_one::<String>("config") {
             Some(path) => Self::from_file(path),
             None => {
@@ -554,6 +609,7 @@ impl Config {
                 }
             }
         };
+
         if let Some(interval) = cmds.get_one::<u64>("feed-check-interval") {
             config.feed.check_interval = Duration::from_secs(*interval);
         }
@@ -603,6 +659,9 @@ impl Config {
         if let Some(enable) = cmds.get_one::<bool>("enable-get-scans") {
             config.endpoints.enable_get_scans = *enable;
         }
+        if let Some(enable) = cmds.get_one::<bool>("enable-get-performance") {
+            config.endpoints.enable_get_performance = Some(*enable);
+        }
         if let Some(api_key) = cmds.get_one::<String>("api-key") {
             config.endpoints.key = Some(api_key.clone());
         }
@@ -626,19 +685,65 @@ impl Config {
                 config.storage.fs.key = Some(key.clone());
             }
         }
+
+        let scan_prefs: HashMap<String, ScanPrefValue> = PREFERENCES
+            .iter()
+            .map(|pref| {
+                let val = match pref.default {
+                    PreferenceValue::Bool(_) => {
+                        if let Some(p) = cmds.get_one::<bool>(pref.id) {
+                            ScanPrefValue::Bool(*p)
+                        } else if let Some(p) = config.scanner.preferences.get(pref.id) {
+                            Self::ret_pref_value_or_panic_with_wrong_type(p, "bool", pref.id)
+                        } else {
+                            pref.default.clone().into()
+                        }
+                    }
+                    PreferenceValue::String(_) => {
+                        if let Some(p) = cmds.get_one::<String>(pref.id) {
+                            ScanPrefValue::String(p.to_string())
+                        } else if let Some(p) = config.scanner.preferences.get(pref.id) {
+                            Self::ret_pref_value_or_panic_with_wrong_type(p, "string", pref.id)
+                        } else {
+                            pref.default.clone().into()
+                        }
+                    }
+                    PreferenceValue::Int(_) => {
+                        if let Some(p) = cmds.get_one::<i64>(pref.id) {
+                            ScanPrefValue::Int(*p)
+                        } else if let Some(p) = config.scanner.preferences.get(pref.id) {
+                            Self::ret_pref_value_or_panic_with_wrong_type(p, "int", pref.id)
+                        } else {
+                            pref.default.clone().into()
+                        }
+                    }
+                };
+                (pref.id.to_string(), val)
+            })
+            .collect();
+
+        config.scanner.preferences = scan_prefs;
         config
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{path::PathBuf, time::Duration};
-
     use crate::config::StorageType;
+    use scannerlib::scanner::preferences::preference::ScanPrefValue;
+    use std::{path::PathBuf, time::Duration};
 
     #[test]
     fn defaults() {
-        let config = super::Config::default();
+        let mut config = super::Config::default();
+        config
+            .scanner
+            .preferences
+            .insert("aaa".to_string(), ScanPrefValue::Bool(false));
+        config.scanner.preferences.insert(
+            "bbb".to_string(),
+            ScanPrefValue::String("foobar".to_string()),
+        );
 
         assert_eq!(
             config.feed.path,
@@ -647,6 +752,7 @@ mod tests {
         assert_eq!(config.feed.check_interval, Duration::from_secs(3600));
 
         assert!(!config.endpoints.enable_get_scans);
+        assert!(config.endpoints.enable_get_performance.is_none());
         assert!(config.endpoints.key.is_none());
 
         assert!(config.tls.certs.is_none());

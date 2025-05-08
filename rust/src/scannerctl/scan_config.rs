@@ -5,93 +5,86 @@
 use std::fmt::{Display, Formatter};
 use std::{io::BufReader, path::PathBuf, sync::Arc};
 
-use clap::{arg, value_parser, Arg, ArgAction, Command};
 use scannerlib::models::{Parameter, Port, Protocol, Scan, VT};
-use scannerlib::storage::{ContextKey, DefaultDispatcher, Retriever, StorageError};
+use scannerlib::nasl::WithErrorInfo;
+use scannerlib::storage::Retriever;
+use scannerlib::storage::error::StorageError;
+use scannerlib::storage::inmemory::InMemoryStorage;
+use scannerlib::storage::items::nvt::{Feed, Nvt, Oid};
 use serde::Deserialize;
 
-use crate::{get_path_from_openvas, read_openvas_config, CliError, CliErrorKind};
-use scannerlib::storage::item::{NVTField, NVTKey};
-use scannerlib::storage::Field;
-use scannerlib::storage::Retrieve;
+use crate::{CliError, CliErrorKind, Filename, get_path_from_openvas, read_openvas_config};
 use std::collections::{HashMap, HashSet};
 use std::io::BufRead;
 
-pub fn extend_args(cmd: Command) -> Command {
-    cmd.subcommand( crate::add_verbose(
-            Command::new("scan-config")
-                .about("Transforms a scan-config xml to a scan json for openvasd.
-When piping a scan json it is enriched with the scan-config xml and may the portlist otherwise it will print a scan json without target or credentials.")
-                .arg(arg!(-p --path <FILE> "Path to the feed.") .required(false)
-                    .value_parser(value_parser!(PathBuf)))
-                .arg(Arg::new("scan-config").required(true).action(ArgAction::Append))
-                .arg(arg!(-i --input "Parses scan json from stdin.").required(false).action(ArgAction::SetTrue))
-                .arg(arg!(-l --portlist <FILE> "Path to the port list xml") .required(false))
-        )
-    )
+#[derive(clap::Parser)]
+/// Transforms a scan-config xml to a scan json for openvasd.
+pub struct ScanConfigArgs {
+    /// Print more details while running
+    #[arg(short, long, action = clap::ArgAction::Count)]
+    pub verbose: u8,
+    /// Print only error output.
+    #[arg(short, long)]
+    pub quiet: bool,
+
+    /// Path to the feed containing the scan-config.
+    pub path: Option<PathBuf>,
+    /// Path to the XML file with the port list
+    pub portlist: Option<PathBuf>,
+    /// If enabled, parse the scan json from stdin
+    #[clap(short, long)]
+    pub stdin: bool,
+    /// A list of paths of the scan configurations
+    pub scan_config: Vec<PathBuf>,
 }
 
-pub async fn run(root: &clap::ArgMatches) -> Option<Result<(), CliError>> {
-    let (args, _) = crate::get_args_set_logging(root, "scan-config")?;
-
-    let feed = args.get_one::<PathBuf>("path").cloned();
-    let config: Vec<String> = args
-        .get_many::<String>("scan-config")
-        .expect("scan-config is required")
-        .cloned()
-        .collect();
-    let port_list = args.get_one::<String>("portlist").cloned();
+pub async fn run(args: ScanConfigArgs) -> Result<(), CliError> {
+    let port_list = &args.portlist;
     tracing::debug!("port_list: {port_list:?}");
-    let stdin = args.get_one::<bool>("input").cloned().unwrap_or_default();
-    Some(execute(feed.as_ref(), &config, port_list.as_ref(), stdin).await)
+    execute(
+        args.path.as_ref(),
+        &args.scan_config,
+        args.portlist.as_ref(),
+        args.stdin,
+    )
+    .await
 }
 
 async fn execute(
     feed: Option<&PathBuf>,
-    config: &[String],
-    port_list: Option<&String>,
+    config: &[PathBuf],
+    port_list: Option<&PathBuf>,
     stdin: bool,
 ) -> Result<(), CliError> {
-    let map_error = |f: &str, e: Error| CliError {
-        filename: f.to_string(),
-        kind: CliErrorKind::Corrupt(format!("{e:?}")),
-    };
-    let as_bufreader = |f: &str| {
-        let file = std::fs::File::open(f).map_err(|e| CliError {
-            filename: f.to_string(),
-            kind: CliErrorKind::Corrupt(format!("{e:?}")),
-        })?;
+    let map_error =
+        |f: &PathBuf, e: Error| CliErrorKind::Corrupt(format!("{e:?}")).with(Filename(f));
+    let as_bufreader = |f: &PathBuf| {
+        let file = std::fs::File::open(f)
+            .map_err(|e| CliErrorKind::Corrupt(format!("{e:?}")).with(Filename(f)))?;
         let reader = BufReader::new(file);
         Ok::<BufReader<std::fs::File>, CliError>(reader)
     };
-    let storage = Arc::new(DefaultDispatcher::new());
-    let mut scan = {
-        if stdin {
-            tracing::debug!("reading scan config from stdin");
-            serde_json::from_reader(std::io::stdin()).map_err(|e| CliError {
-                filename: "".to_string(),
-                kind: CliErrorKind::Corrupt(format!("{e:?}")),
-            })?
-        } else {
-            Scan::default()
-        }
+    let storage = Arc::new(InMemoryStorage::new());
+    let mut scan = if stdin {
+        tracing::debug!("reading scan config from stdin");
+        serde_json::from_reader(std::io::stdin())
+            .map_err(|e| CliErrorKind::Corrupt(format!("{e:?}")))?
+    } else {
+        Scan::default()
     };
     let feed = match feed {
         Some(feed) => feed.to_owned(),
         None => read_openvas_config()
             .map(get_path_from_openvas)
-            .map_err(|e| CliError {
-                filename: "".to_string(),
-                kind: CliErrorKind::Corrupt(format!("{e:?}")),
-            })?,
+            .map_err(|e| CliErrorKind::Corrupt(format!("{e:?}")))?,
     };
 
     tracing::info!("loading feed. This may take a while.");
-    crate::feed::update::run(Arc::clone(&storage), feed.to_owned(), false).await?;
+    crate::feed::update::run(Arc::clone(&storage), &feed, false).await?;
     tracing::info!("feed loaded.");
     let ports = match port_list {
         Some(ports) => {
-            tracing::debug!("reading port list from {ports}");
+            tracing::debug!("reading port list from {ports:?}");
             let reader = as_bufreader(ports)?;
             parse_portlist(reader).map_err(|e| map_error(ports, e))?
         }
@@ -106,10 +99,8 @@ async fn execute(
     }
     scan.vts.extend(vts);
     scan.target.ports = ports;
-    let out = serde_json::to_string_pretty(&scan).map_err(|e| CliError {
-        filename: config.join(","),
-        kind: CliErrorKind::Corrupt(format!("{e:?}")),
-    })?;
+    let out =
+        serde_json::to_string_pretty(&scan).map_err(|e| CliErrorKind::Corrupt(format!("{e:?}")))?;
     println!("{}", out);
     Ok(())
 }
@@ -273,7 +264,11 @@ struct ScanConfigPreferenceNvt {
     name: String,
 }
 
-pub fn parse_vts<R>(sc: R, retriever: &dyn Retriever, vts: &[VT]) -> Result<Vec<VT>, Error>
+pub trait OspStorage: Retriever<Oid, Item = Nvt> + Retriever<Feed, Item = Vec<Nvt>> {}
+
+impl OspStorage for InMemoryStorage {}
+
+pub fn parse_vts<R>(sc: R, retriever: &dyn OspStorage, vts: &[VT]) -> Result<Vec<VT>, Error>
 where
     R: BufRead,
 {
@@ -322,45 +317,53 @@ where
                     vec![]
                 }
             } else if s.nvt_type == 1 {
-                // lookup oids via family
-                // TODO: if it's empty we should return all not None
-                match retriever.retrieve_by_field(
-                    Field::NVT(NVTField::Family(s.family_or_nvt.clone())),
-                    Retrieve::NVT(Some(NVTKey::Oid)),
-                ) {
-                    Ok(nvt) => {
-                        let result: Vec<_> = nvt
-                            .flat_map(|(_, f)| match &f {
-                                Field::NVT(NVTField::Oid(oid)) if is_not_already_present(oid) => {
-                                    Some(oid_to_vt(oid))
-                                }
-                                _ => None,
-                            })
-                            .collect();
-
-                        tracing::debug!(
-                            "found {} nvt entries for family {}",
-                            result.len(),
-                            s.family_or_nvt
-                        );
-                        result
+                // Retrieving the whole feed is always wrapped in a Some. In case there are no vts in the
+                // feed, the result will be an empty vector.
+                match retriever.retrieve(&Feed) {
+                    Ok(Some(vts)) => {
+                        if s.family_or_nvt.is_empty() {
+                            let oids: Vec<_> = vts
+                                .iter()
+                                .filter(|x| is_not_already_present(&x.oid))
+                                .map(|x| oid_to_vt(&x.oid))
+                                .collect();
+                            tracing::debug!("found {} nvt entries", oids.len(),);
+                            oids
+                        } else {
+                            let fvts: Vec<_> = vts
+                                .clone()
+                                .into_iter()
+                                .filter(|x| {
+                                    x.family == s.family_or_nvt && is_not_already_present(&x.oid)
+                                })
+                                .map(|x| oid_to_vt(&x.oid))
+                                .collect();
+                            tracing::debug!(
+                                "found {} nvt entries for family {}",
+                                fvts.len(),
+                                s.family_or_nvt
+                            );
+                            fvts
+                        }
                     }
+                    Ok(None) => vec![],
                     Err(e) => vec![Err(e.into())],
                 }
             } else {
-                match retriever.retrieve(&ContextKey::default(), Retrieve::NVT(Some(NVTKey::Oid))) {
-                    Ok(fields) => {
-                        let oids: Vec<_> = fields
-                            .flat_map(|f| match &f {
-                                Field::NVT(NVTField::Oid(oid)) if is_not_already_present(oid) => {
-                                    Some(oid_to_vt(oid))
-                                }
-                                _ => None,
-                            })
+                // Retrieving the whole feed is always wrapped in a Some. In case there are no vts in the
+                // feed, the result will be an empty vector.
+                match retriever.retrieve(&Feed) {
+                    Ok(Some(vts)) => {
+                        let oids: Vec<_> = vts
+                            .iter()
+                            .filter(|x| x.oid == s.family_or_nvt)
+                            .map(|x| oid_to_vt(&x.oid))
                             .collect();
-
                         tracing::debug!("found {} nvt entries", oids.len(),);
                         oids
+                    }
+                    Ok(None) => {
+                        unreachable!();
                     }
                     Err(e) => vec![Err(e.into())],
                 }
@@ -371,7 +374,11 @@ where
 
 #[cfg(test)]
 mod tests {
-    use scannerlib::storage::{item::NVTField, ContextKey, DefaultDispatcher, Field, Storage};
+
+    use scannerlib::storage::{
+        Dispatcher,
+        items::nvt::{FileName, Nvt},
+    };
 
     use super::*;
 
@@ -475,20 +482,18 @@ mod tests {
         let result = quick_xml::de::from_str::<ScanConfig>(sc).unwrap();
         assert_eq!(result.nvt_selectors.nvt_selector.len(), 2);
         assert_eq!(result.preferences.preference.len(), 3);
-        let shop: DefaultDispatcher = DefaultDispatcher::default();
+        let shop: InMemoryStorage = InMemoryStorage::default();
         let add_product_detection = |oid: &str| {
-            shop.as_dispatcher()
-                .dispatch(
-                    &ContextKey::FileName(oid.to_string()),
-                    Field::NVT(NVTField::Oid(oid.to_owned().to_string())),
-                )
-                .unwrap();
-            shop.as_dispatcher()
-                .dispatch(
-                    &ContextKey::FileName(oid.to_string()),
-                    Field::NVT(NVTField::Family("Product detection".to_string())),
-                )
-                .unwrap();
+            shop.dispatch(
+                FileName(oid.to_string()),
+                Nvt {
+                    oid: oid.to_string(),
+                    filename: oid.to_string(),
+                    family: "Product detection".to_string(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
         };
         add_product_detection("1");
         add_product_detection("2");

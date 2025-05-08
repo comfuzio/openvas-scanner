@@ -9,9 +9,11 @@ use crate::models::{self, FixedPackage, FixedVersion, PackageType, Specifier};
 use crate::{
     notus::error::Error,
     notus::packages::{
-        deb::Deb, ebuild::EBuild, rpm::Rpm, slack::Slack, windows::Windows, Package,
+        Package, deb::Deb, ebuild::EBuild, rpm::Rpm, slack::Slack, windows::Windows,
     },
 };
+
+use super::packages::alpm::Alpm;
 
 /// VulnerabilityTests is a collection of Tests to detect vulnerabilities, in case of notus these
 /// consist of package names and versions, all corresponding to an OID.
@@ -26,6 +28,7 @@ pub enum Product {
     Rpm(VulnerabilityTests<Rpm>),
     Slack(VulnerabilityTests<Slack>),
     Windows(VulnerabilityTests<Windows>),
+    Alpm(VulnerabilityTests<Alpm>),
 }
 
 impl Product {
@@ -48,7 +51,7 @@ impl Product {
                             return Err(Error::VulnerabilityTestParseError(
                                 "".to_string(),
                                 fixed_package,
-                            ))
+                            ));
                         }
                     };
                 // Add vulnerability test to map
@@ -89,6 +92,10 @@ impl TryFrom<models::Product> for Product {
             PackageType::MSP => {
                 let vts = Self::transform(value.vulnerability_tests)?;
                 Ok(Self::Windows(vts))
+            }
+            PackageType::ALPM => {
+                let vts = Self::transform(value.vulnerability_tests)?;
+                Ok(Self::Alpm(vts))
             }
         }
     }

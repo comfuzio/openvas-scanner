@@ -24,7 +24,7 @@ pub use sessions::SshSessions as Ssh;
 
 use std::time::Duration;
 
-use ::russh::{cipher, Preferred};
+use ::russh::{Preferred, cipher};
 use russh_keys::key;
 
 use crate::nasl::prelude::*;
@@ -152,7 +152,7 @@ impl Ssh {
         let port = port
             .filter(|_| socket.is_none())
             .unwrap_or(DEFAULT_SSH_PORT);
-        let ip = ctx.target_ip();
+        let ip = ctx.target().ip_addr();
         let timeout = timeout.map(Duration::from_secs);
         let keytype = keytype
             .map(|keytype| keytype.0)

@@ -6,7 +6,7 @@ use std::sync::{Arc, RwLock};
 
 use crate::models::{self, Protocol, ResultType};
 
-use crate::{nasl::prelude::*, storage::Field};
+use crate::nasl::prelude::*;
 
 #[cfg(test)]
 mod tests;
@@ -49,21 +49,23 @@ impl Reporting {
             Some("udp") => Protocol::UDP,
             _ => Protocol::TCP,
         };
+        let target = context.target();
+        let hostname = target.hostname();
+        let ip_address = target.ip_addr();
         let result = models::Result {
             id: self.id(),
             r_type: typus,
-            ip_address: Some(context.target().to_string()),
-            // TODO: where to get hostname? is it only vhost relevant?
-            hostname: None,
-            oid: Some(context.key().value()),
+            ip_address: Some(ip_address.to_string()),
+            hostname,
+            oid: Some(context.scan().0.clone()),
             port,
             protocol: Some(protocol),
             message: data,
             detail: None,
         };
         context
-            .dispatcher()
-            .retry_dispatch(5, context.key(), Field::Result(result.into()))?;
+            .storage()
+            .retry_dispatch(context.scan().clone(), result, 5)?;
         Ok(NaslValue::Null)
     }
 

@@ -7,22 +7,23 @@
 use std::{
     fmt::{self, Display, Formatter},
     panic::Location,
+    path::PathBuf,
 };
 
-use crate::storage::ContextKey;
-use crate::{
-    nasl::{
-        prelude::*,
-        syntax::{Loader, NoOpLoader},
-    },
-    storage::{DefaultDispatcher, Storage},
+use crate::nasl::{
+    prelude::*,
+    syntax::{Loader, NoOpLoader},
 };
+use crate::storage::{ScanID, inmemory::InMemoryStorage};
 use futures::{Stream, StreamExt};
 
 use super::{
-    builtin::ContextFactory,
-    interpreter::{CodeInterpreter, InterpretErrorKind},
-    utils::Executor,
+    interpreter::{ForkingInterpreter, InterpretError, InterpretErrorKind},
+    nasl_std_functions,
+    utils::{
+        Executor,
+        context::{ContextStorage, Target},
+    },
 };
 
 // The following exists to trick the trait solver into
@@ -117,31 +118,87 @@ enum TestResult {
 /// If the `TestBuilder` is dropped, it will automatically verify that
 /// the given code fulfill the requirements (such as producing the right
 /// values or the right errors).
-pub struct TestBuilder<L: Loader, S: Storage> {
+pub struct TestBuilder<L: Loader, S: ContextStorage> {
     lines: Vec<String>,
     results: Vec<TracedTestResult>,
-    context: ContextFactory<L, S>,
-    context_key: ContextKey,
+    scan_id: ScanID,
+    filename: PathBuf,
+    target: String,
     variables: Vec<(String, NaslValue)>,
     should_verify: bool,
+    loader: L,
+    storage: S,
+    executor: Executor,
 }
 
-pub type DefaultTestBuilder = TestBuilder<NoOpLoader, DefaultDispatcher>;
+pub type DefaultTestBuilder = TestBuilder<NoOpLoader, InMemoryStorage>;
 
-impl Default for TestBuilder<NoOpLoader, DefaultDispatcher> {
+impl Default for TestBuilder<NoOpLoader, InMemoryStorage> {
     fn default() -> Self {
         Self {
             lines: vec![],
             results: vec![],
-            context: ContextFactory::default(),
-            context_key: ContextKey::default(),
+            scan_id: Default::default(),
+            filename: Default::default(),
+            target: Default::default(),
             variables: vec![],
             should_verify: true,
+            loader: NoOpLoader::default(),
+            storage: InMemoryStorage::default(),
+            executor: nasl_std_functions(),
         }
     }
 }
 
-impl TestBuilder<NoOpLoader, DefaultDispatcher> {
+impl<S> TestBuilder<NoOpLoader, S>
+where
+    S: ContextStorage,
+{
+    pub fn from_storage(storage: S) -> Self {
+        // Unfortunately, we can't really get rid of all this duplication here, since
+        // struct update syntax won't work due to different generics.
+        // We also can't provide a with_storage method, since there is no way to clone
+        // the storage.
+        Self {
+            lines: vec![],
+            results: vec![],
+            scan_id: Default::default(),
+            filename: Default::default(),
+            target: Default::default(),
+            variables: vec![],
+            should_verify: true,
+            loader: NoOpLoader::default(),
+            storage,
+            executor: nasl_std_functions(),
+        }
+    }
+}
+
+impl<L> TestBuilder<L, InMemoryStorage>
+where
+    L: Loader,
+{
+    pub fn from_loader(loader: L) -> Self {
+        // Unfortunately, we can't really get rid of all this duplication here, since
+        // struct update syntax won't work due to different generics.
+        // We also can't provide a with_loader method, since there is no way to clone
+        // the loader.
+        Self {
+            lines: vec![],
+            results: vec![],
+            scan_id: Default::default(),
+            filename: Default::default(),
+            target: Default::default(),
+            variables: vec![],
+            should_verify: true,
+            loader,
+            storage: InMemoryStorage::default(),
+            executor: nasl_std_functions(),
+        }
+    }
+}
+
+impl TestBuilder<NoOpLoader, InMemoryStorage> {
     /// Construct a `TestBuilder`, immediately run the
     /// given code on it and return it.
     pub fn from_code(code: impl AsRef<str>) -> Self {
@@ -154,7 +211,7 @@ impl TestBuilder<NoOpLoader, DefaultDispatcher> {
 impl<L, S> TestBuilder<L, S>
 where
     L: Loader,
-    S: Storage,
+    S: ContextStorage,
 {
     #[track_caller]
     fn add_line(&mut self, line: impl Into<String>, val: TestResult) -> &mut Self {
@@ -214,11 +271,29 @@ where
         self.should_verify = false;
     }
 
-    /// Return the list of results returned by all the lines of
-    /// code.
+    /// Runs the given lines of code and returns the list of results.
     pub fn results(&self) -> Vec<NaslResult> {
+        self.results_and_context().0
+    }
+
+    /// Runs the given lines of code and returns the list of results
+    /// along with the `Context` used for evaluating them.
+    pub fn results_and_context(&self) -> (Vec<NaslResult>, Context) {
+        futures::executor::block_on(async {
+            let context = self.context();
+            (
+                self.results_stream(&self.code(), &context).collect().await,
+                context,
+            )
+        })
+    }
+
+    /// Return the list of `NaslValue`s returned by all the lines of
+    /// code, panics on any occurring error.
+    pub fn values(&self) -> Vec<NaslValue> {
         futures::executor::block_on(async {
             self.results_stream(&self.code(), &self.context())
+                .map(|x| x.unwrap())
                 .collect()
                 .await
         })
@@ -228,22 +303,34 @@ where
         self.lines.join("\n")
     }
 
-    pub fn results_stream<'a>(
-        &'a self,
-        code: &'a str,
-        context: &'a Context,
-    ) -> impl Stream<Item = NaslResult> + 'a {
+    fn interpreter<'code, 'ctx>(
+        &self,
+        code: &'code str,
+        context: &'ctx Context,
+    ) -> ForkingInterpreter<'code, 'ctx> {
         let variables: Vec<_> = self
             .variables
             .iter()
             .map(|(k, v)| (k.clone(), ContextType::Value(v.clone())))
             .collect();
         let register = Register::root_initial(&variables);
-        // let code = self.lines.join("\n");
-        // let context = self.context();
+        ForkingInterpreter::new(code, register, context)
+    }
 
-        let parser = CodeInterpreter::new(code, register, context);
-        parser.stream().map(|res| {
+    pub fn interpreter_results(&self) -> Vec<Result<NaslValue, InterpretError>> {
+        let code = self.code();
+        let context = self.context();
+        let interpreter = self.interpreter(&code, &context);
+        futures::executor::block_on(async { interpreter.stream().collect().await })
+    }
+
+    pub fn results_stream<'a>(
+        &'a self,
+        code: &'a str,
+        context: &'a Context,
+    ) -> impl Stream<Item = NaslResult> + 'a {
+        let interpreter = self.interpreter(code, context);
+        interpreter.stream().map(|res| {
             res.map_err(|e| match e.kind {
                 InterpretErrorKind::FunctionCallError(f) => f.kind,
                 e => panic!("Unknown error: {}", e),
@@ -251,9 +338,19 @@ where
         })
     }
 
-    /// Get the currently set `Context`.
-    pub fn context(&self) -> Context {
-        self.context.build(self.context_key.clone())
+    fn context(&self) -> Context {
+        let target = Target::do_not_resolve_hostname(&self.target);
+        let context = ContextBuilder {
+            storage: &self.storage,
+            loader: &self.loader,
+            executor: &self.executor,
+            scan_id: self.scan_id.clone(),
+            target,
+            filename: self.filename.clone(),
+            scan_preferences: Vec::default(),
+        }
+        .build();
+        context
     }
 
     /// Check that no errors were returned by any
@@ -292,12 +389,13 @@ where
     }
 
     pub async fn async_verify(mut self) {
-        if let Err(err) = self.verify().await {
-            // Drop first so we don't call the destructor, which would panic.
-            std::mem::forget(self);
-            panic!("{}", err)
-        } else {
-            std::mem::forget(self)
+        match self.verify().await {
+            Err(err) => {
+                // Drop first so we don't call the destructor, which would panic.
+                std::mem::forget(self);
+                panic!("{}", err)
+            }
+            _ => std::mem::forget(self),
         }
     }
 
@@ -342,30 +440,21 @@ where
         }
     }
 
-    /// Return a new `TestBuilder` with the given `Context`.
-    pub fn with_context<L2: Loader, S2: Storage>(
-        self,
-        context: ContextFactory<L2, S2>,
-    ) -> TestBuilder<L2, S2> {
-        TestBuilder {
-            lines: self.lines.clone(),
-            results: self.results.clone(),
-            should_verify: self.should_verify,
-            variables: self.variables.clone(),
-            context,
-            context_key: self.context_key.clone(),
-        }
+    /// Return a new `TestBuilder` with the given `filename`.
+    pub fn with_filename(mut self, filename: PathBuf) -> Self {
+        self.filename = filename;
+        self
     }
 
-    /// Return a new `TestBuilder` with the given `ContextKey`.
-    pub fn with_context_key(mut self, key: ContextKey) -> Self {
-        self.context_key = key;
+    /// Return a new `TestBuilder` with the given `target`.
+    pub fn with_target(mut self, target: String) -> Self {
+        self.target = target;
         self
     }
 
     /// Return a new `TestBuilder` with the given `Executor`.
     pub fn with_executor(mut self, executor: Executor) -> Self {
-        self.context.functions = executor;
+        self.executor = executor;
         self
     }
 
@@ -375,7 +464,7 @@ where
     }
 }
 
-impl<L: Loader, S: Storage> Drop for TestBuilder<L, S> {
+impl<L: Loader, S: ContextStorage> Drop for TestBuilder<L, S> {
     fn drop(&mut self) {
         if tokio::runtime::Handle::try_current().is_ok() {
             panic!("To use TestBuilder in an asynchronous context, explicitly call async_verify()");

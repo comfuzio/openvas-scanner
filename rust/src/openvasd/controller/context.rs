@@ -2,12 +2,14 @@
 //
 // SPDX-License-Identifier: GPL-2.0-or-later WITH x11vnc-openssl-exception
 
-use async_trait::async_trait;
-use scannerlib::storage::DefaultDispatcher;
-use scannerlib::{feed, nasl::FSPluginLoader};
-use std::sync::{Arc, RwLock};
-
 use crate::{config, notus::NotusWrapper, response, scheduling, tls::TlsConfig};
+use async_trait::async_trait;
+use scannerlib::{
+    feed, nasl::FSPluginLoader, scanner::preferences::preference,
+    storage::inmemory::InMemoryStorage,
+};
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 
 use scannerlib::models::scanner::{
     Error, ScanDeleter, ScanResultFetcher, ScanResults, ScanStarter, ScanStopper,
@@ -32,6 +34,8 @@ pub struct ContextBuilder<S, DB, T> {
     notus: Option<NotusWrapper>,
     scheduler_config: Option<config::Scheduler>,
     mode: config::Mode,
+    enable_get_performance: bool,
+    preferences: Option<preference::ScanPreferences>,
 }
 
 impl<S>
@@ -51,6 +55,8 @@ impl<S>
             notus: None,
             scheduler_config: None,
             mode: config::Mode::default(),
+            enable_get_performance: false,
+            preferences: None,
         }
     }
 }
@@ -66,7 +72,7 @@ impl<S, DB, T> ContextBuilder<S, DB, T> {
         self.feed_config = Some(config);
         if let Some(fp) = self.feed_config.as_ref() {
             let loader = FSPluginLoader::new(fp.path.clone());
-            let dispatcher: DefaultDispatcher = DefaultDispatcher::default();
+            let dispatcher: InMemoryStorage = InMemoryStorage::default();
             let version = feed::version(&loader, &dispatcher)
                 .await
                 .unwrap_or_else(|_| String::from("UNDEFINED"));
@@ -87,9 +93,22 @@ impl<S, DB, T> ContextBuilder<S, DB, T> {
         self
     }
 
+    /// Set scanner preferences
+    pub fn scan_preferences(mut self, prefs: HashMap<String, preference::ScanPrefValue>) -> Self {
+        let mut prefs_bind = preference::ScanPreferences::new();
+        prefs_bind.override_default_preferences(prefs);
+        self.preferences = Some(prefs_bind);
+        self
+    }
+
     /// Enables the GET /scans endpoint.
     pub fn enable_get_scans(mut self, enable: bool) -> Self {
         self.enable_get_scans = enable;
+        self
+    }
+
+    pub fn enable_get_performance(mut self, enable: Option<bool>) -> Self {
+        self.enable_get_performance = enable.unwrap_or_default();
         self
     }
 
@@ -119,6 +138,8 @@ impl<S, DB, T> ContextBuilder<S, DB, T> {
             notus,
             scheduler_config,
             mode,
+            enable_get_performance,
+            preferences,
         } = self;
         ContextBuilder {
             scanner,
@@ -132,6 +153,8 @@ impl<S, DB, T> ContextBuilder<S, DB, T> {
             notus,
             scheduler_config,
             mode,
+            enable_get_performance,
+            preferences,
         }
     }
 }
@@ -154,6 +177,8 @@ impl<S, DB> ContextBuilder<S, DB, NoScanner> {
             notus,
             scheduler_config,
             mode,
+            enable_get_performance,
+            preferences,
         } = self;
         ContextBuilder {
             scanner: Scanner(scanner),
@@ -167,20 +192,25 @@ impl<S, DB> ContextBuilder<S, DB, NoScanner> {
             notus,
             scheduler_config,
             mode,
+            enable_get_performance,
+            preferences,
         }
     }
 }
 
 impl<S, DB> ContextBuilder<S, DB, Scanner<S>> {
     fn configure_authentication_methods(&mut self) {
-        let tls_config = if let Some(tls_config) = self.tls_config.take() {
-            if tls_config.has_clients && self.api_key.is_some() {
-                tracing::warn!("Client certificates and api key are configured. To disable the possibility to bypass client verification the API key is ignored.");
-                self.api_key = None;
+        let tls_config = match self.tls_config.take() {
+            Some(tls_config) => {
+                if tls_config.has_clients && self.api_key.is_some() {
+                    tracing::warn!(
+                        "Client certificates and api key are configured. To disable the possibility to bypass client verification the API key is ignored."
+                    );
+                    self.api_key = None;
+                }
+                Some(tls_config)
             }
-            Some(tls_config)
-        } else {
-            None
+            _ => None,
         };
         self.tls_config = tls_config;
         match (self.tls_config.is_some(), self.api_key.is_some()) {
@@ -212,8 +242,10 @@ impl<S, DB> ContextBuilder<S, DB, Scanner<S>> {
             api_key: self.api_key,
             tls_config: self.tls_config,
             enable_get_scans: self.enable_get_scans,
+            enable_get_performance: self.enable_get_performance,
             notus: self.notus,
             mode: self.mode,
+            scan_preferences: self.preferences,
         }
     }
 }
@@ -232,6 +264,8 @@ pub struct Context<S, DB> {
     pub tls_config: Option<TlsConfig>,
     /// Whether to enable the GET /scans endpoint
     pub enable_get_scans: bool,
+    /// Whether to enable the GET /health/performance endpoint
+    pub enable_get_performance: bool,
     pub mode: config::Mode,
     /// Aborts the background loops
     pub abort: RwLock<bool>,
@@ -242,6 +276,7 @@ pub struct Context<S, DB> {
     /// This allows us to throttle requests per need and gives us control when to start/stop/delete
     /// a scan.
     pub scheduler: scheduling::Scheduler<DB, S>,
+    pub scan_preferences: Option<preference::ScanPreferences>,
 }
 
 #[derive(Debug, Clone, Default)]

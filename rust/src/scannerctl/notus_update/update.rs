@@ -2,30 +2,52 @@
 //
 // SPDX-License-Identifier: GPL-2.0-or-later WITH x11vnc-openssl-exception
 
+use std::path::Path;
 use std::path::PathBuf;
 
+use crate::Filename;
 use crate::{CliError, CliErrorKind};
 
 use scannerlib::feed;
 use scannerlib::models;
+use scannerlib::nasl::WithErrorInfo;
 use scannerlib::nasl::syntax::{FSPluginLoader, LoadError};
 use scannerlib::notus::{AdvisoryLoader, HashsumAdvisoryLoader};
-use scannerlib::storage::{ContextKey, Dispatcher, Field};
+use scannerlib::storage::Dispatcher;
+use scannerlib::storage::items::notus_advisory::NotusCache;
+use scannerlib::storage::redis::RedisAddAdvisory;
+use scannerlib::storage::redis::RedisAddNvt;
+use scannerlib::storage::redis::RedisGetNvt;
+use scannerlib::storage::redis::RedisStorage;
+use scannerlib::storage::redis::RedisWrapper;
+
+pub trait NotusStorage:
+    Dispatcher<(), Item = models::VulnerabilityData> + Dispatcher<NotusCache, Item = ()>
+{
+}
+
+impl<S> NotusStorage for RedisStorage<S> where
+    S: RedisWrapper + RedisAddNvt + RedisAddAdvisory + RedisGetNvt + Send
+{
+}
+
+pub fn signature_error(e: impl std::fmt::Display) -> CliError {
+    CliErrorKind::LoadError(LoadError::Dirty(e.to_string()))
+        .with(Filename(Path::new(feed::Hasher::Sha256.sum_file())))
+}
 
 pub fn run<S>(storage: S, path: PathBuf, signature_check: bool) -> Result<(), CliError>
 where
-    S: Sync + Send + Dispatcher,
+    S: NotusStorage,
 {
     let loader = FSPluginLoader::new(path);
     let advisories_files = match HashsumAdvisoryLoader::new(loader.clone()) {
         Ok(loader) => loader,
         Err(_) => {
-            return Err(CliError {
-                filename: "".to_string(),
-                kind: CliErrorKind::LoadError(LoadError::Dirty(
-                    "Problem loading advisory".to_string(),
-                )),
-            })
+            return Err(CliErrorKind::LoadError(LoadError::Dirty(
+                "Problem loading advisory".to_string(),
+            ))
+            .into());
         }
     };
 
@@ -38,17 +60,11 @@ where
             }
             Err(feed::VerifyError::BadSignature(e)) => {
                 tracing::warn!("{}", e);
-                return Err(CliError {
-                    filename: feed::Hasher::Sha256.sum_file().to_string(),
-                    kind: crate::CliErrorKind::LoadError(LoadError::Dirty(e)),
-                });
+                return Err(signature_error(e));
             }
             Err(e) => {
                 tracing::warn!("Unexpected error during signature verification: {e}");
-                return Err(CliError {
-                    filename: feed::Hasher::Sha256.sum_file().to_string(),
-                    kind: crate::CliErrorKind::LoadError(LoadError::Dirty(e.to_string())),
-                });
+                return Err(signature_error(e));
             }
         }
     }
@@ -59,19 +75,16 @@ where
 
         for adv in advisories.advisories {
             let _ = storage.dispatch(
-                &ContextKey::FileName(filename.to_owned()),
-                Field::NotusAdvisory(Box::new(Some(models::VulnerabilityData {
+                (),
+                models::VulnerabilityData {
                     adv,
                     family: advisories.family.clone(),
                     filename: filename.to_owned(),
-                }))),
+                },
             );
         }
     }
-    let _ = storage.dispatch(
-        &ContextKey::FileName("notuscache".to_string()),
-        Field::NotusAdvisory(Box::new(None)),
-    );
+    let _ = storage.dispatch(NotusCache, ());
 
     Ok(())
 }

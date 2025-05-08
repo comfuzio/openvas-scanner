@@ -50,7 +50,7 @@ impl From<Credentials> for Vec<models::Credential> {
                 let kind = match &x.kind as &str {
                     "usk" => CredentialType::USK {
                         username,
-                        password,
+                        password: Some(password),
                         private_key: key("private", &x.credentials),
                         privilege,
                     },
@@ -302,7 +302,9 @@ impl<'de> Deserialize<'de> for Target {
                                         continue;
                                     }
                                 }
-                                return Err(de::Error::custom(format!("{at} is not a valid number. It must be a number of 1, 2, 4, 8 or 16.")));
+                                return Err(de::Error::custom(format!(
+                                    "{at} is not a valid number. It must be a number of 1, 2, 4, 8 or 16."
+                                )));
                             }
                         }
                         "alive_test_methods" => {
@@ -551,6 +553,17 @@ impl From<models::Credential> for Credential {
         let kind = value.credential_type.as_ref().to_string();
         let mut credentials = Vec::new();
         match value.credential_type {
+            models::CredentialType::KRB5 {
+                username,
+                password,
+                realm,
+                kdc,
+            } => {
+                credentials.push(("username".to_string(), username));
+                credentials.push(("password".to_string(), password));
+                credentials.push(("realm".to_string(), realm));
+                credentials.push(("kdc".to_string(), kdc));
+            }
             models::CredentialType::UP {
                 username,
                 password,
@@ -570,7 +583,7 @@ impl From<models::Credential> for Credential {
                 privilege,
             } => {
                 credentials.push(("username".to_string(), username));
-                credentials.push(("password".to_string(), password));
+                credentials.push(("password".to_string(), password.unwrap_or_default()));
                 credentials.push(("private".to_string(), private_key));
                 if let Some(p) = privilege {
                     credentials.push(("priv_username".to_string(), p.username));
@@ -648,11 +661,7 @@ impl From<Vec<models::VT>> for VtSelection {
                             text: Some(x.value),
                         })
                         .collect::<Vec<_>>();
-                    if v.is_empty() {
-                        None
-                    } else {
-                        Some(v)
-                    }
+                    if v.is_empty() { None } else { Some(v) }
                 };
                 VtSingle {
                     id: x.oid,
