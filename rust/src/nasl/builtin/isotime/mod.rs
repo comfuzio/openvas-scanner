@@ -29,14 +29,12 @@ fn parse_readable_time(time: &str) -> Option<NaiveDateTime> {
     if let Ok(time) = NaiveDateTime::parse_from_str(time, "%Y-%m-%d %H:%M") {
         return Some(time);
     }
-    if let Some((date, hours)) = time.split_once(" ") {
-        if let Ok(date) = NaiveDate::parse_from_str(date, "%Y-%m-%d") {
-            if let Ok(hours) = hours.parse::<u32>() {
-                if let Some(time) = date.and_hms_opt(hours, 0, 0) {
-                    return Some(time);
-                }
-            }
-        }
+    if let Some((date, hours)) = time.split_once(" ")
+        && let Ok(date) = NaiveDate::parse_from_str(date, "%Y-%m-%d")
+        && let Ok(hours) = hours.parse::<u32>()
+        && let Some(time) = date.and_hms_opt(hours, 0, 0)
+    {
+        return Some(time);
     }
     if let Ok(date) = NaiveDate::parse_from_str(time, "%Y-%m-%d") {
         // Cannot fail, since we add no time to the date
@@ -54,8 +52,7 @@ fn parse_time(time: &str) -> Result<NaiveDateTime, IsotimeError> {
         return Ok(time);
     }
     Err(IsotimeError(format!(
-        "The given time is not in the correct isotime ({}) or readable time format ({}): {}",
-        ISOFORMAT, READABLEFORMAT, time
+        "The given time is not in the correct isotime ({ISOFORMAT}) or readable time format ({READABLEFORMAT}): {time}"
     )))
 }
 

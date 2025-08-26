@@ -4,39 +4,39 @@
 
 //! Defines NASL frame forgery and arp functions
 
-use pnet::datalink::interfaces;
 use pnet_base::MacAddr;
 use std::fmt;
 use std::{net::Ipv4Addr, str::FromStr};
 
 use pcap::{Capture, Device};
 
-use super::RawIpError;
-use super::raw_ip_utils::{get_interface_by_local_ip, get_source_ip, ipstr2ipaddr};
+use super::raw_ip_utils::{
+    forge_arp_frame, get_interface_by_local_ip, get_local_mac_address, get_source_ip, ipstr2ipaddr,
+};
 
 use tracing::info;
 
 use crate::nasl::prelude::*;
-use crate::nasl::utils::NaslVars;
+use crate::nasl::utils::DefineGlobalVars;
+use crate::nasl::utils::function::Seconds;
+use crate::nasl::utils::function::utils::DEFAULT_TIMEOUT;
 
 /// Hardware type ethernet
-pub const ARPHRD_ETHER: u16 = 0x0001;
+const ARPHRD_ETHER: u16 = 0x0001;
 /// Protocol type IP
-pub const ETHERTYPE_IP: u16 = 0x0800;
+const ETHERTYPE_IP: u16 = 0x0800;
 /// Protocol type ARP
 pub const ETHERTYPE_ARP: u16 = 0x0806;
 /// Length in bytes of an ethernet mac address
-pub const ETH_ALEN: u8 = 0x0006;
+const ETH_ALEN: u8 = 0x0006;
 /// Protocol length for ARP
-pub const ARP_PROTO_LEN: u8 = 0x0004;
+const ARP_PROTO_LEN: u8 = 0x0004;
 /// ARP operation request
-pub const ARPOP_REQUEST: u16 = 0x0001;
-/// Default Timeout for received
-pub const DEFAULT_TIMEOUT: i32 = 5000;
+const ARPOP_REQUEST: u16 = 0x0001;
 
 #[derive(Debug)]
 /// Structure to hold a datalink layer frame
-pub struct Frame {
+pub(crate) struct Frame {
     /// Source MAC address
     srchaddr: MacAddr,
     /// Destination MAC address
@@ -48,7 +48,7 @@ pub struct Frame {
 }
 
 impl Frame {
-    pub fn new() -> Frame {
+    pub(crate) fn new() -> Frame {
         Frame {
             srchaddr: MacAddr::zero(),
             dsthaddr: MacAddr::zero(),
@@ -57,20 +57,20 @@ impl Frame {
         }
     }
 
-    pub fn set_srchaddr(&mut self, srchaddr: MacAddr) -> &Frame {
+    pub(crate) fn set_srchaddr(&mut self, srchaddr: MacAddr) -> &Frame {
         self.srchaddr = srchaddr;
         self
     }
-    pub fn set_dsthaddr(&mut self, dsthaddr: MacAddr) -> &Frame {
+    pub(crate) fn set_dsthaddr(&mut self, dsthaddr: MacAddr) -> &Frame {
         self.dsthaddr = dsthaddr;
         self
     }
-    pub fn set_ethertype(&mut self, ethertype: u16) -> &Frame {
+    pub(crate) fn set_ethertype(&mut self, ethertype: u16) -> &Frame {
         self.ethertype = ethertype;
         self
     }
 
-    pub fn set_payload(&mut self, payload: Vec<u8>) -> &Frame {
+    pub(crate) fn set_payload(&mut self, payload: Vec<u8>) -> &Frame {
         self.payload = payload;
         self
     }
@@ -139,7 +139,7 @@ impl fmt::Display for Frame {
                 s.push('\n');
             }
         }
-        write!(f, "{}", s)
+        write!(f, "{s}")
     }
 }
 
@@ -184,7 +184,7 @@ pub struct ArpFrame {
 }
 
 impl ArpFrame {
-    pub fn new() -> ArpFrame {
+    pub(crate) fn new() -> ArpFrame {
         ArpFrame {
             arphdr: ARP_HEADER,
             srchaddr: MacAddr::zero(),
@@ -195,19 +195,19 @@ impl ArpFrame {
         }
     }
 
-    pub fn set_srchaddr(&mut self, srchaddr: MacAddr) -> &ArpFrame {
+    pub(crate) fn set_srchaddr(&mut self, srchaddr: MacAddr) -> &ArpFrame {
         self.srchaddr = srchaddr;
         self
     }
-    pub fn set_srcip(&mut self, srcip: Ipv4Addr) -> &ArpFrame {
+    pub(crate) fn set_srcip(&mut self, srcip: Ipv4Addr) -> &ArpFrame {
         self.srcip = srcip;
         self
     }
-    pub fn set_dsthaddr(&mut self, dsthaddr: MacAddr) -> &ArpFrame {
+    pub(crate) fn set_dsthaddr(&mut self, dsthaddr: MacAddr) -> &ArpFrame {
         self.dsthaddr = dsthaddr;
         self
     }
-    pub fn set_dstip(&mut self, dstip: Ipv4Addr) -> &ArpFrame {
+    pub(crate) fn set_dstip(&mut self, dstip: Ipv4Addr) -> &ArpFrame {
         self.dstip = dstip;
         self
     }
@@ -236,23 +236,6 @@ impl From<ArpFrame> for Vec<u8> {
     }
 }
 
-/// Forge a data link layer frame with an ARP request in the payload
-fn forge_arp_frame(eth_src: MacAddr, src_ip: Ipv4Addr, dst_ip: Ipv4Addr) -> Vec<u8> {
-    let mut frame = Frame::new();
-    frame.set_srchaddr(eth_src);
-    frame.set_dsthaddr(MacAddr::broadcast());
-    frame.set_ethertype(ETHERTYPE_ARP.to_le());
-
-    let mut arp_frame = ArpFrame::new();
-    arp_frame.set_srchaddr(eth_src);
-    arp_frame.set_srcip(src_ip);
-    arp_frame.set_dsthaddr(MacAddr::zero());
-    arp_frame.set_dstip(dst_ip);
-
-    frame.set_payload(arp_frame.into());
-    frame.into()
-}
-
 /// Forge a datalink layer frame with data in the payload
 fn forge_frame(src: MacAddr, dst: MacAddr, ether_proto: u16, payload: Vec<u8>) -> Vec<u8> {
     let mut frame = Frame::new();
@@ -271,22 +254,13 @@ fn convert_vec_into_mac_address(v: &[u8]) -> Option<MacAddr> {
     }
 }
 
-fn validate_mac_address(v: Option<&ContextType>) -> Result<MacAddr, FnError> {
+fn validate_mac_address(v: Option<&NaslValue>) -> Result<MacAddr, FnError> {
     let mac_addr = match v {
-        Some(ContextType::Value(NaslValue::String(x))) => MacAddr::from_str(x).ok(),
-        Some(ContextType::Value(NaslValue::Data(x))) => convert_vec_into_mac_address(x),
+        Some(NaslValue::String(x)) => MacAddr::from_str(x).ok(),
+        Some(NaslValue::Data(x)) => convert_vec_into_mac_address(x),
         _ => None,
     };
     mac_addr.ok_or_else(|| FnError::wrong_unnamed_argument("mac address", "invalid mac address"))
-}
-
-/// Return the MAC address, given the interface name
-fn get_local_mac_address(name: &str) -> Result<MacAddr, FnError> {
-    interfaces()
-        .into_iter()
-        .find(|x| x.name == *name)
-        .and_then(|dev| dev.mac)
-        .ok_or_else(|| RawIpError::FailedToGetLocalMacAddress.into())
 }
 
 /// Return a frame given a capture device and a filter. It returns an empty frame in case
@@ -308,8 +282,8 @@ fn recv_frame(cap: &mut Capture<pcap::Active>, filter: &str) -> Result<Frame, Fn
 fn send_frame(
     frame: &[u8],
     iface: &Device,
-    pcap_active: &bool,
-    filter: Option<&String>,
+    pcap_active: bool,
+    filter: Option<&str>,
     timeout: i32,
 ) -> Result<Option<Frame>, FnError> {
     let mut capture_dev = match Capture::from_device(iface.clone()) {
@@ -323,7 +297,7 @@ fn send_frame(
         Err(_) => return Ok(None),
     };
 
-    if !(*pcap_active) {
+    if !pcap_active {
         return Ok(None);
     }
 
@@ -345,16 +319,16 @@ fn send_frame(
 /// It takes the following argument:
 /// - cap_timeout: time to wait for answer in seconds, 5 by default
 #[nasl_function]
-fn nasl_send_arp_request(register: &Register, context: &Context) -> Result<NaslValue, FnError> {
-    let timeout = match register.named("pcap_timeout") {
-        Some(ContextType::Value(NaslValue::Number(x))) => *x as i32 * 1000i32, // to milliseconds
-        None => DEFAULT_TIMEOUT,
-        _ => {
+fn nasl_send_arp_request(register: &Register, context: &ScanCtx) -> Result<NaslValue, FnError> {
+    let timeout = match register.nasl_value("pcap_timeout") {
+        Ok(NaslValue::Number(x)) => *x as i32 * 1000i32, // to milliseconds
+        Ok(_) => {
             return Err(FnError::wrong_unnamed_argument(
                 "Integer",
                 "Invalid timeout value",
             ));
         }
+        Err(_) => DEFAULT_TIMEOUT,
     };
 
     let target_ip = context.target().ip_addr();
@@ -388,9 +362,9 @@ fn nasl_send_arp_request(register: &Register, context: &Context) -> Result<NaslV
     };
 
     let arp_frame = forge_arp_frame(local_mac_address, src_ip, dst_ip);
-    let filter = format!("arp and src host {}", target_ip);
+    let filter = format!("arp and src host {target_ip}");
     // send the frame and get a response if pcap_active enabled
-    match send_frame(&arp_frame, &iface, &true, Some(&filter), timeout)? {
+    match send_frame(&arp_frame, &iface, true, Some(&filter), timeout)? {
         Some(f) => Ok(NaslValue::String(format!("{}", f.srchaddr))),
         None => Ok(NaslValue::Null),
     }
@@ -430,16 +404,16 @@ fn nasl_get_local_mac_address_from_ip(register: &Register) -> Result<NaslValue, 
 /// - payload: is any data, which is then attached as payload to the frame.
 #[nasl_function]
 fn nasl_forge_frame(register: &Register) -> Result<NaslValue, FnError> {
-    let src_haddr = validate_mac_address(register.named("src_haddr"))?;
-    let dst_haddr = validate_mac_address(register.named("dst_haddr"))?;
-    let ether_proto = match register.named("ether_proto") {
-        Some(ContextType::Value(NaslValue::Number(x))) => *x as u16,
+    let src_haddr = validate_mac_address(register.nasl_value("src_haddr").ok())?;
+    let dst_haddr = validate_mac_address(register.nasl_value("dst_haddr").ok())?;
+    let ether_proto = match register.nasl_value("ether_proto") {
+        Ok(NaslValue::Number(x)) => *x as u16,
         _ => ETHERTYPE_IP,
     };
 
-    let payload: Vec<u8> = match register.named("payload") {
-        Some(ContextType::Value(NaslValue::String(x))) => x.clone().into_bytes(),
-        Some(ContextType::Value(NaslValue::Data(x))) => x.clone(),
+    let payload: Vec<u8> = match register.nasl_value("payload") {
+        Ok(NaslValue::String(x)) => x.clone().into_bytes(),
+        Ok(NaslValue::Data(x)) => x.clone(),
         _ => vec![],
     };
 
@@ -457,45 +431,18 @@ fn nasl_forge_frame(register: &Register) -> Result<NaslValue, FnError> {
 /// - pcap_active: option to capture the answer, default is TRUE
 /// - pcap_filter: filter for the answer
 /// - pcap_timeout: time to wait for the answer in seconds, default 5
-#[nasl_function]
-fn nasl_send_frame(register: &Register, context: &Context) -> Result<NaslValue, FnError> {
-    let frame = match register.named("frame") {
-        Some(ContextType::Value(NaslValue::Data(x))) => x,
-        _ => return Err(FnError::wrong_unnamed_argument("Data", "Invalid data type")),
-    };
-
-    let pcap_active = match register.named("pcap_active") {
-        Some(ContextType::Value(NaslValue::Boolean(x))) => x,
-        None => &true,
-        _ => {
-            return Err(FnError::wrong_unnamed_argument(
-                "Boolean",
-                "Invalid pcap_active value",
-            ));
-        }
-    };
-
-    let filter = match register.named("pcap_filter") {
-        Some(ContextType::Value(NaslValue::String(x))) => Some(x),
-        None => None,
-        _ => {
-            return Err(FnError::wrong_unnamed_argument(
-                "String",
-                "Invalid pcap_filter value",
-            ));
-        }
-    };
-
-    let timeout = match register.named("pcap_timeout") {
-        Some(ContextType::Value(NaslValue::Number(x))) => *x as i32 * 1000i32, // to milliseconds
-        None => DEFAULT_TIMEOUT,
-        _ => {
-            return Err(FnError::wrong_unnamed_argument(
-                "Integer",
-                "Invalid timeout value",
-            ));
-        }
-    };
+#[nasl_function(named(frame, pcap_active, pcap_filter, timeout))]
+fn nasl_send_frame(
+    context: &ScanCtx,
+    frame: &[u8],
+    pcap_active: Option<bool>,
+    pcap_filter: Option<&str>,
+    timeout: Option<Seconds>,
+) -> Result<NaslValue, FnError> {
+    let pcap_active = pcap_active.unwrap_or(true);
+    let timeout = timeout
+        .map(|secs| secs.as_millis() as i32)
+        .unwrap_or(DEFAULT_TIMEOUT * 1000);
 
     let target_ip = context.target().ip_addr();
 
@@ -503,7 +450,7 @@ fn nasl_send_frame(register: &Register, context: &Context) -> Result<NaslValue, 
     let iface = get_interface_by_local_ip(local_ip)?;
 
     // send the frame and get a response if pcap_active enabled
-    match send_frame(frame, &iface, pcap_active, filter, timeout)? {
+    match send_frame(frame, &iface, pcap_active, pcap_filter, timeout)? {
         Some(f) => Ok(NaslValue::Data(f.into())),
         None => Ok(NaslValue::Null),
     }
@@ -514,35 +461,13 @@ fn nasl_send_frame(register: &Register, context: &Context) -> Result<NaslValue, 
 /// This function is meant to be used for debugging.
 #[nasl_function]
 fn nasl_dump_frame(register: &Register) -> Result<NaslValue, FnError> {
-    let frame: Frame = match register.named("frame") {
-        Some(ContextType::Value(NaslValue::Data(x))) => (x as &[u8]).try_into()?,
+    let frame: Frame = match register.nasl_value("frame") {
+        Ok(NaslValue::Data(x)) => (x as &[u8]).try_into()?,
         _ => return Err(FnError::wrong_unnamed_argument("Data", "Invalid data type")),
     };
 
     info!(frame=%frame);
     Ok(NaslValue::Null)
-}
-
-/// Returns a NaslVars with all predefined variables which must be expose to nasl script
-pub fn expose_vars() -> NaslVars<'static> {
-    let builtin_vars: NaslVars = [
-        // Hardware type ethernet
-        ("ARPHRD_ETHER", NaslValue::Number(ARPHRD_ETHER.into())),
-        // Protocol type IP
-        ("ETHERTYPE_IP", NaslValue::Number(ETHERTYPE_IP.into())),
-        // Protocol type ARP
-        ("ETHERTYPE_ARP", NaslValue::Number(ETHERTYPE_ARP.into())),
-        // Length in bytes of an ethernet mac address
-        ("ETH_ALEN", NaslValue::Number(ETH_ALEN.into())),
-        // Protocol length for ARP
-        ("ARP_PROTO_LEN", NaslValue::Number(ARP_PROTO_LEN.into())),
-        // ARP operation request
-        ("ARPOP_REQUEST", NaslValue::Number(ARPOP_REQUEST.into())),
-    ]
-    .iter()
-    .cloned()
-    .collect();
-    builtin_vars
 }
 
 pub struct FrameForgery;
@@ -556,6 +481,25 @@ function_set! {
         (nasl_get_local_mac_address_from_ip, "get_local_mac_address_from_ip"),
         (nasl_send_arp_request, "send_arp_request"),
     )
+}
+
+impl DefineGlobalVars for FrameForgery {
+    fn get_global_vars() -> Vec<(&'static str, NaslValue)> {
+        vec![
+            // Hardware type ethernet
+            ("ARPHRD_ETHER", NaslValue::Number(ARPHRD_ETHER.into())),
+            // Protocol type IP
+            ("ETHERTYPE_IP", NaslValue::Number(ETHERTYPE_IP.into())),
+            // Protocol type ARP
+            ("ETHERTYPE_ARP", NaslValue::Number(ETHERTYPE_ARP.into())),
+            // Length in bytes of an ethernet mac address
+            ("ETH_ALEN", NaslValue::Number(ETH_ALEN.into())),
+            // Protocol length for ARP
+            ("ARP_PROTO_LEN", NaslValue::Number(ARP_PROTO_LEN.into())),
+            // ARP operation request
+            ("ARPOP_REQUEST", NaslValue::Number(ARPOP_REQUEST.into())),
+        ]
+    }
 }
 
 #[cfg(test)]
@@ -588,7 +532,7 @@ mod tests {
     #[test]
     fn get_local_mac() {
         if cfg!(target_os = "macos") {
-            assert!(matches!(get_local_mac_address("lo"), Err(_)));
+            assert!(get_local_mac_address("lo").is_err());
         } else {
             assert_eq!(get_local_mac_address("lo").unwrap(), MacAddr::zero());
         }

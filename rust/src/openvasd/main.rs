@@ -3,6 +3,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later WITH x11vnc-openssl-exception
 
 #![doc = include_str!("README.md")]
+// We allow this fow now, since it would require lots of changes
+// but should eventually solve this.
+#![allow(clippy::result_large_err)]
 
 use std::marker::{Send, Sync};
 
@@ -13,7 +16,7 @@ use scannerlib::models::scanner::{
     ScanDeleter, ScanResultFetcher, ScanStarter, ScanStopper, Scanner,
 };
 use scannerlib::nasl::FSPluginLoader;
-use scannerlib::nasl::utils::context::ContextStorage;
+use scannerlib::nasl::utils::scan_ctx::ContextStorage;
 use scannerlib::notus::{HashsumProductLoader, Notus};
 use scannerlib::openvas::{self, cmd};
 use scannerlib::osp;
@@ -31,16 +34,16 @@ use crate::{
     crypt::ChaCha20Crypt,
     storage::{FeedHash, file, inmemory, redis},
 };
-pub mod config;
-pub mod controller;
-pub mod crypt;
-pub mod feed;
-pub mod notus;
-pub mod request;
-pub mod response;
+mod config;
+mod controller;
+mod crypt;
+mod feed;
+mod notus;
+mod request;
+mod response;
 mod scheduling;
-pub mod storage;
-pub mod tls;
+mod storage;
+mod tls;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 fn setup_log(config: &Config) {
@@ -164,7 +167,7 @@ where
     let storage = St::from_config_and_feeds(config, feeds)?;
 
     match config.scanner.scanner_type {
-        ScannerType::OSPD => {
+        ScannerType::Ospd => {
             let scanner = make_osp_scanner(config);
             run_with_scanner_and_storage(scanner, storage, config).await
         }

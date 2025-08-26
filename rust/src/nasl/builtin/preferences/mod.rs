@@ -7,7 +7,7 @@ use crate::scanner::preferences::preference::PREFERENCES;
 #[nasl_function(named(id))]
 fn script_get_preference(
     register: &Register,
-    config: &Context,
+    config: &ScanCtx,
     name: Option<String>,
     id: Option<usize>,
 ) -> Option<NaslValue> {
@@ -29,22 +29,21 @@ fn script_get_preference(
 
     // A parameter name is given. Search for the param in NVT metadata to get the ID.
     // Then, search with the ID in the scan config, otherwise return the default value from the NVT metadata.
-    if let Some(pref_name) = name {
-        if let Some(pref) = config
+    if let Some(pref_name) = name
+        && let Some(pref) = config
             .nvt()
             .clone()
             .and_then(|nvt| nvt.preferences.into_iter().find(|p| p.name == pref_name))
-        {
-            return register
-                .script_param(pref.id().unwrap() as usize)
-                .or_else(|| Some(NaslValue::String(pref.default().to_string())));
-        }
+    {
+        return register
+            .script_param(pref.id().unwrap() as usize)
+            .or_else(|| Some(NaslValue::String(pref.default().to_string())));
     }
     None
 }
 
 #[nasl_function]
-fn get_preference(config: &Context, name: String) -> Option<NaslValue> {
+fn get_preference(config: &ScanCtx, name: String) -> Option<NaslValue> {
     let val = if let Some(pref) = config.scan_params().find(|p| p.id == name) {
         pref.value.clone()
     } else {

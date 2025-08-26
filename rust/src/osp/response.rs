@@ -265,7 +265,7 @@ impl From<Response> for Status {
 
 impl Response {
     /// Get the status of the response
-    pub fn status(self) -> Status {
+    fn status(self) -> Status {
         match self {
             Response::Failure { status } => status,
             Response::StartScan { status, .. } => status,
@@ -285,13 +285,6 @@ pub struct Status {
     #[serde(rename = "@status")]
     /// Status code
     pub code: StringU64,
-}
-
-impl Status {
-    /// Check if the status is OK
-    pub fn is_ok(&self) -> bool {
-        self.code.0 == 200
-    }
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -368,18 +361,24 @@ pub struct ScanResult {
 
 impl From<&ScanResult> for crate::models::ResultType {
     fn from(sr: &ScanResult) -> Self {
-        match (sr.name.as_str(), &sr.result_type) {
-            ("HOST_START", ResultType::Log) => crate::models::ResultType::HostStart,
-            ("HOST_END", ResultType::Log) => crate::models::ResultType::HostEnd,
-            ("DEADHOST", ResultType::Log) => crate::models::ResultType::DeadHost,
-            ("Host Details", ResultType::Log) => crate::models::ResultType::HostDetail,
-            (_, ResultType::Log) => crate::models::ResultType::Log,
-            (_, ResultType::Alarm) => crate::models::ResultType::Alarm,
-            (_, ResultType::Error) => crate::models::ResultType::Error,
-            (_, ResultType::HostStart) => crate::models::ResultType::HostStart,
-            (_, ResultType::HostEnd) => crate::models::ResultType::HostEnd,
+        match (
+            sr.port.clone().unwrap_or("".to_string()).as_str(),
+            sr.name.as_str(),
+            &sr.result_type,
+        ) {
+            // Not only the Host Details script produces host details. Therefore, check the port
+            ("general/Host_Details", _, ResultType::Log) => crate::models::ResultType::HostDetail,
+            (_, "HOST_START", ResultType::Log) => crate::models::ResultType::HostStart,
+            (_, "HOST_END", ResultType::Log) => crate::models::ResultType::HostEnd,
+            (_, "DEADHOST", ResultType::Log) => crate::models::ResultType::DeadHost,
+            (_, "Host Details", ResultType::Log) => crate::models::ResultType::HostDetail,
+            (_, _, ResultType::Log) => crate::models::ResultType::Log,
+            (_, _, ResultType::Alarm) => crate::models::ResultType::Alarm,
+            (_, _, ResultType::Error) => crate::models::ResultType::Error,
+            (_, _, ResultType::HostStart) => crate::models::ResultType::HostStart,
+            (_, _, ResultType::HostEnd) => crate::models::ResultType::HostEnd,
             // host details are sent via log messages
-            (_, ResultType::HostDetail) => unreachable!(),
+            (_, _, ResultType::HostDetail) => unreachable!(),
         }
     }
 }
@@ -390,7 +389,7 @@ struct HostDetail {
 }
 
 impl HostDetail {
-    pub fn extract(&self) -> Option<crate::models::Detail> {
+    fn extract(&self) -> Option<crate::models::Detail> {
         self.detail.first().cloned()
     }
 }
@@ -441,18 +440,6 @@ pub struct Results {
     /// Results
     #[serde(default)]
     pub result: Vec<ScanResult>,
-}
-
-impl Results {
-    /// Push a result to the results
-    pub fn push(&mut self, result: ScanResult) {
-        self.result.push(result);
-    }
-
-    /// Extend the results with another results
-    pub fn extend(&mut self, results: Results) {
-        self.result.extend(results.result);
-    }
 }
 
 impl From<Results> for Vec<crate::models::Result> {
@@ -728,7 +715,7 @@ mod tests {
                     panic!("no scan");
                 }
             }
-            _ => panic!("wrong type: {:?}", response),
+            _ => panic!("wrong type: {response:?}"),
         }
     }
 
@@ -759,7 +746,7 @@ mod tests {
                     panic!("no scan");
                 }
             }
-            _ => panic!("wrong type: {:?}", response),
+            _ => panic!("wrong type: {response:?}"),
         }
     }
 
@@ -783,9 +770,7 @@ mod tests {
                    port="443/tcp"
                    test_id=""
                    name="Path disclosure vulnerability"
-                   type="Log Message">
-             bla
-           </result>
+                   type="Log Message">bla</result>
          </results>
          <progress>
             <host name="127.0.0.1">45</host>
@@ -828,7 +813,7 @@ mod tests {
                     panic!("no scan");
                 }
             }
-            _ => panic!("wrong type: {:?}", response),
+            _ => panic!("wrong type: {response:?}"),
         }
     }
 

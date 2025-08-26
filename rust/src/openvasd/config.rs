@@ -68,7 +68,7 @@ pub struct Scanner {
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub enum ScannerType {
     #[serde(rename = "ospd")]
-    OSPD,
+    Ospd,
     #[serde(rename = "openvas")]
     Openvas,
     #[serde(rename = "openvasd")]
@@ -77,7 +77,7 @@ pub enum ScannerType {
 
 impl Default for ScannerType {
     fn default() -> Self {
-        Self::OSPD
+        Self::Ospd
     }
 }
 
@@ -91,7 +91,7 @@ impl TypedValueParser for ScannerType {
         value: &std::ffi::OsStr,
     ) -> Result<Self::Value, clap::Error> {
         Ok(match value.to_str().unwrap_or_default() {
-            "ospd" => ScannerType::OSPD,
+            "ospd" => ScannerType::Ospd,
             "openvas" => ScannerType::Openvas,
             "openvasd" => ScannerType::Openvasd,
             x => {
@@ -342,7 +342,7 @@ impl Config {
     fn load_user() -> Option<Self> {
         match std::env::var("HOME") {
             Ok(home) => {
-                let path = format!("{}/.config/openvasd/openvasd.toml", home);
+                let path = format!("{home}/.config/openvasd/openvasd.toml");
                 if !std::fs::exists(&path).unwrap_or_default() {
                     return None;
                 }
@@ -371,7 +371,7 @@ impl Config {
             (ScanPrefValue::Bool(_), "bool") => p.clone(),
             (ScanPrefValue::Int(_), "int") => p.clone(),
             (ScanPrefValue::String(_), "string") => p.clone(),
-            _ => panic!("Wrong value type. Expected {} for {}", expected, name),
+            _ => panic!("Wrong value type. Expected {expected} for {name}"),
         }
     }
 
@@ -484,7 +484,7 @@ impl Config {
                     .env("SCANNER_TYPE")
                     .long("scanner-type")
                     .value_name("ospd,openvas")
-                    .value_parser(ScannerType::OSPD)
+                    .value_parser(ScannerType::Ospd)
                     .help("Type of scanner used to manage scans")
             )
             .arg(
@@ -680,10 +680,10 @@ impl Config {
         if let Some(mode) = cmds.get_one::<Mode>("mode") {
             config.mode = mode.clone();
         }
-        if let Some(key) = cmds.get_one::<String>("storage_key") {
-            if !key.is_empty() {
-                config.storage.fs.key = Some(key.clone());
-            }
+        if let Some(key) = cmds.get_one::<String>("storage_key")
+            && !key.is_empty()
+        {
+            config.storage.fs.key = Some(key.clone());
         }
 
         let scan_prefs: HashMap<String, ScanPrefValue> = PREFERENCES

@@ -4,15 +4,17 @@
 
 use std::{fmt::Display, net::IpAddr};
 
+#[cfg(feature = "nasl-builtin-raw-ip")]
+use crate::nasl::raw_ip_utils::raw_ip_utils;
 use crate::{nasl::prelude::*, storage::items::kb::KbKey};
 
 #[allow(clippy::module_inception)]
 pub mod network;
-pub mod network_utils;
+mod network_utils;
 pub mod socket;
-pub mod tcp;
-pub mod tls;
-pub mod udp;
+mod tcp;
+mod tls;
+mod udp;
 
 // 512 Bytes are typically supported by network devices. The ip header maximum size is 60 and a UDP
 // header contains 8 bytes, which must be subtracted from the max size for UDP packages.
@@ -22,12 +24,19 @@ const MTU: usize = 512 - 60 - 8;
 const DEFAULT_PORT: u16 = 33435;
 
 // Get the max MTU possible for network communication
-// TODO: Calculate the MTU dynamically
-pub fn mtu(_: IpAddr) -> usize {
+#[cfg(not(feature = "nasl-builtin-raw-ip"))]
+fn mtu(_: IpAddr) -> usize {
     MTU
 }
+#[cfg(feature = "nasl-builtin-raw-ip")]
+fn mtu(target_ip: IpAddr) -> usize {
+    match raw_ip_utils::get_mtu(target_ip) {
+        Ok(mtu) => mtu,
+        Err(_) => MTU,
+    }
+}
 
-pub enum OpenvasEncaps {
+enum OpenvasEncaps {
     Auto = 0, /* Request auto detection.  */
     Ip,
     Ssl23, /* Ask for compatibility options */
@@ -42,7 +51,7 @@ pub enum OpenvasEncaps {
 }
 
 impl OpenvasEncaps {
-    pub fn from_i64(val: i64) -> Option<Self> {
+    fn from_i64(val: i64) -> Option<Self> {
         match val {
             0 => Some(Self::Auto),
             1 => Some(Self::Ip),
@@ -76,7 +85,7 @@ impl Display for OpenvasEncaps {
     }
 }
 
-pub fn get_retry(context: &Context) -> u8 {
+fn get_retry(context: &ScanCtx) -> u8 {
     if let Ok(val) = context.get_single_kb_item(&KbKey::TimeoutRetry) {
         match val {
             NaslValue::String(val) => val.parse::<u8>().unwrap_or(2),
@@ -96,11 +105,17 @@ pub fn get_retry(context: &Context) -> u8 {
 
 pub struct Port(u16);
 
+impl From<Port> for u16 {
+    fn from(value: Port) -> Self {
+        value.0
+    }
+}
+
 impl FromNaslValue<'_> for Port {
     fn from_nasl_value(value: &NaslValue) -> Result<Self, FnError> {
         let port = i64::from_nasl_value(value)?;
         if !(0..=65535).contains(&port) {
-            Err(ArgumentError::WrongArgument(format!("{} is not a valid port number", port)).into())
+            Err(ArgumentError::WrongArgument(format!("{port} is not a valid port number")).into())
         } else {
             Ok(Port(port as u16))
         }

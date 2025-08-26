@@ -1,15 +1,17 @@
 use super::Scan;
+use super::preferences::preference::ScanPrefs;
 use crate::models::Phase;
 use crate::models::Protocol;
 use crate::models::VT;
 use crate::models::scanner::{ScanResultFetcher, ScanResults};
-use crate::nasl::ContextBuilder;
+use crate::nasl::Code;
+use crate::nasl::ScanCtxBuilder;
 use crate::nasl::interpreter::ForkingInterpreter;
+use crate::nasl::interpreter::Register;
 use crate::nasl::nasl_std_functions;
-use crate::nasl::syntax::NaslValue;
+use crate::nasl::prelude::NaslValue;
 use crate::nasl::utils::Executor;
-use crate::nasl::utils::Register;
-use crate::nasl::utils::context::Target;
+use crate::nasl::utils::scan_ctx::Target;
 use crate::scanner::Scanner;
 use crate::scanner::{
     error::{ExecuteError, ScriptResult},
@@ -35,7 +37,7 @@ use tracing_test::traced_test;
 
 type TestStack = (Arc<InMemoryStorage>, fn(&str) -> String);
 
-pub fn setup(scripts: &[(String, Nvt)]) -> (TestStack, Executor, Scan) {
+fn setup(scripts: &[(String, Nvt)]) -> (TestStack, Executor, Scan) {
     let storage = InMemoryStorage::new();
     scripts.iter().map(|(_, v)| v).for_each(|n| {
         storage
@@ -45,6 +47,7 @@ pub fn setup(scripts: &[(String, Nvt)]) -> (TestStack, Executor, Scan) {
     let scan = Scan {
         scan_id: "sid".to_string(),
         targets: vec![Target::do_not_resolve_hostname("test.host")],
+        ports: Default::default(),
         vts: scripts
             .iter()
             .map(|(_, v)| VT {
@@ -52,7 +55,9 @@ pub fn setup(scripts: &[(String, Nvt)]) -> (TestStack, Executor, Scan) {
                 parameters: vec![],
             })
             .collect(),
-        scan_preferences: Vec::new(),
+        scan_preferences: ScanPrefs::new(),
+        alive_test_methods: Vec::new(),
+        alive_test_ports: Vec::new(),
     };
     let executor = nasl_std_functions();
     ((Arc::new(storage), loader), executor, scan)
@@ -68,7 +73,7 @@ fn make_scanner_and_scan(scripts: &[(String, Nvt)]) -> (Scanner<TestStack>, Scan
     (Scanner::new(storage, loader, executor), scan)
 }
 
-pub fn only_success() -> [(String, Nvt); 3] {
+fn only_success() -> [(String, Nvt); 3] {
     [
         GenerateScript::with_dependencies("0", &[]).generate(),
         GenerateScript::with_dependencies("1", &["0.nasl"]).generate(),
@@ -83,7 +88,7 @@ fn loader(s: &str) -> String {
 }
 
 #[derive(Debug, Default)]
-pub struct GenerateScript {
+struct GenerateScript {
     pub id: String,
     pub rc: usize,
     pub dependencies: Vec<String>,
@@ -95,7 +100,7 @@ pub struct GenerateScript {
 }
 
 impl GenerateScript {
-    pub fn with_dependencies(id: &str, dependencies: &[&str]) -> GenerateScript {
+    fn with_dependencies(id: &str, dependencies: &[&str]) -> GenerateScript {
         let dependencies = dependencies.iter().map(|x| x.to_string()).collect();
 
         GenerateScript {
@@ -105,7 +110,7 @@ impl GenerateScript {
         }
     }
 
-    pub fn with_required_keys(id: &str, required_keys: &[&str]) -> GenerateScript {
+    fn with_required_keys(id: &str, required_keys: &[&str]) -> GenerateScript {
         let required_keys = required_keys.iter().map(|x| x.to_string()).collect();
         GenerateScript {
             id: id.to_string(),
@@ -114,7 +119,7 @@ impl GenerateScript {
         }
     }
 
-    pub fn with_mandatory_keys(id: &str, mandatory_keys: &[&str]) -> GenerateScript {
+    fn with_mandatory_keys(id: &str, mandatory_keys: &[&str]) -> GenerateScript {
         let mandatory_keys = mandatory_keys.iter().map(|x| x.to_string()).collect();
         GenerateScript {
             id: id.to_string(),
@@ -123,7 +128,7 @@ impl GenerateScript {
         }
     }
 
-    pub fn with_excluded_keys(id: &str, exclude_keys: &[&str]) -> GenerateScript {
+    fn with_excluded_keys(id: &str, exclude_keys: &[&str]) -> GenerateScript {
         let exclude = exclude_keys.iter().map(|x| x.to_string()).collect();
         GenerateScript {
             id: id.to_string(),
@@ -132,7 +137,7 @@ impl GenerateScript {
         }
     }
 
-    pub fn with_required_ports(id: &str, ports: &[(Protocol, &str)]) -> GenerateScript {
+    fn with_required_ports(id: &str, ports: &[(Protocol, &str)]) -> GenerateScript {
         let required_tcp_ports = ports
             .iter()
             .filter(|(p, _)| matches!(p, Protocol::TCP))
@@ -153,7 +158,7 @@ impl GenerateScript {
         }
     }
 
-    pub fn generate(&self) -> (String, Nvt) {
+    fn generate(&self) -> (String, Nvt) {
         let keys = |x: &[String]| -> String {
             x.iter().fold(String::default(), |acc, e| {
                 let acc = if acc.is_empty() {
@@ -213,23 +218,31 @@ fn parse_meta_data(filename: &str, code: &str) -> Option<Nvt> {
     ];
     let storage = Arc::new(InMemoryStorage::new());
 
-    let register = Register::root_initial(&initial);
+    let register = Register::from_global_variables(&initial);
     let target = Target::localhost();
+    let ports = Default::default();
     let executor = nasl_std_functions();
     let loader = |_: &str| code.to_string();
     let scan_id = ScanID(filename.to_string());
-    let scan_preferences = Vec::default();
-    let cb = ContextBuilder {
+    let scan_preferences = ScanPrefs::new();
+    let alive_test_methods = Vec::default();
+    let cb = ScanCtxBuilder {
         storage: &storage,
         loader: &loader,
         executor: &executor,
         scan_id,
         target,
+        ports,
         filename,
         scan_preferences,
+        alive_test_methods,
     };
     let context = cb.build();
-    let interpreter = ForkingInterpreter::new(code, register, &context);
+    let ast = Code::from_string(code)
+        .parse_description_block()
+        .emit_errors()
+        .unwrap();
+    let interpreter = ForkingInterpreter::new(ast, register, &context);
     for stmt in interpreter.iter_blocking() {
         if let NaslValue::Exit(_) = stmt.expect("stmt success") {
             break;
@@ -261,6 +274,7 @@ async fn run(
     let scan = Scan {
         scan_id: "sid".to_string(),
         targets: vec![Target::do_not_resolve_hostname("test.host")],
+        ports: Default::default(),
         vts: scripts
             .iter()
             .map(|(_, v)| VT {
@@ -268,7 +282,9 @@ async fn run(
                 parameters: vec![],
             })
             .collect(),
-        scan_preferences: Vec::new(),
+        scan_preferences: ScanPrefs::new(),
+        alive_test_methods: Vec::new(),
+        alive_test_ports: Vec::new(),
     };
 
     let executor = nasl_std_functions();

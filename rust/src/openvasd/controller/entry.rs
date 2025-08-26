@@ -20,6 +20,7 @@ use scannerlib::notus::NotusError;
 use scannerlib::scanner::preferences::preference;
 use tokio::process::Command;
 
+use crate::storage::{self, MappedID};
 use crate::{
     config,
     controller::ClientHash,
@@ -65,7 +66,7 @@ enum KnownPaths {
 }
 
 impl KnownPaths {
-    pub fn requires_id(&self) -> bool {
+    fn requires_id(&self) -> bool {
         !matches!(
             self,
             Self::Unknown | Self::Health(_) | Self::Vts(_) | Self::Notus(_)
@@ -137,17 +138,17 @@ impl KnownPaths {
 impl Display for KnownPaths {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            KnownPaths::Scans(Some(id)) => write!(f, "/scans/{}", id),
+            KnownPaths::Scans(Some(id)) => write!(f, "/scans/{id}"),
             KnownPaths::Scans(None) => write!(f, "/scans"),
             KnownPaths::ScanResults(id, Some(result_id)) => {
-                write!(f, "/scans/{}/results/{}", id, result_id)
+                write!(f, "/scans/{id}/results/{result_id}")
             }
-            KnownPaths::ScanResults(id, None) => write!(f, "/scans/{}/results", id),
-            KnownPaths::ScanStatus(id) => write!(f, "/scans/{}/status", id),
+            KnownPaths::ScanResults(id, None) => write!(f, "/scans/{id}/results"),
+            KnownPaths::ScanStatus(id) => write!(f, "/scans/{id}/status"),
             KnownPaths::Unknown => write!(f, "Unknown"),
             KnownPaths::Vts(None) => write!(f, "/vts"),
             KnownPaths::Vts(Some(oid)) => write!(f, "/vts/{oid}"),
-            KnownPaths::Notus(Some(os)) => write!(f, "/notus/{}", os),
+            KnownPaths::Notus(Some(os)) => write!(f, "/notus/{os}"),
             KnownPaths::Notus(None) => write!(f, "/notus"),
             KnownPaths::Health(HealthOpts::Alive) => write!(f, "/health/alive"),
             KnownPaths::Health(HealthOpts::Ready) => write!(f, "/health/ready"),
@@ -250,22 +251,26 @@ where
                 return Ok(ctx.response.unauthorized());
             }
             let cid = cid.unwrap_or_default();
-            if let Some(scan_id) = kp.scan_id() {
-                if !ctx
-                    .scheduler
-                    .is_client_allowed(scan_id.to_owned(), &cid)
-                    .await
-                    .unwrap()
-                {
-                    tracing::debug!(
-                        "client {:x?} is not allowed to operate on scan {} ",
-                        &cid.0,
-                        scan_id
-                    );
-                    // we return 404 instead of 401 to not leak any ids
-                    return Ok(ctx.response.not_found("scans", scan_id));
-                }
-            }
+            //TODO: although it is ugly, when moving to greenbone-scanner-framework this test will
+            //be handled differently. Therefore I leave it as is, although it is misleading.
+            let mapped_id = match kp.scan_id() {
+                Some(id) => match ctx.scheduler.get_mapped_id(&cid, id).await {
+                    Ok(x) => x,
+                    Err(storage::Error::NotFound) => {
+                        tracing::debug!(
+                            scan_id=id,
+                            client=%cid,
+                            "Not allowed.",
+                        );
+                        // we return 404 instead of 401 to not leak any ids
+                        return Ok(ctx.response.not_found("scans", id));
+                    }
+                    Err(error) => {
+                        return Ok(ctx.response.internal_server_error(&error));
+                    }
+                },
+                None => MappedID::default(),
+            };
 
             tracing::debug!(
                 method=%req.method(),
@@ -400,6 +405,21 @@ where
                             } else {
                                 uuid::Uuid::new_v4().to_string()
                             };
+
+                            if ctx
+                                .scheduler
+                                .get_scan_ids()
+                                .await?
+                                .into_iter()
+                                .any(|i| *i == id)
+                            {
+                                tracing::debug!(%id, "Scan ID already in use");
+                                return Ok(ctx.response.forbidden_with_reason(
+                                    &id,
+                                    "Scan ID already in use".to_string(),
+                                ));
+                            };
+
                             let resp = ctx.response.created(&id);
                             scan.scan_id.clone_from(&id);
 
@@ -408,8 +428,9 @@ where
                             }
 
                             ctx.scheduler.insert_scan(scan).await?;
-                            ctx.scheduler.add_scan_client_id(id.clone(), cid).await?;
-                            tracing::debug!(%id, "Scan created");
+                            let mapped_id =
+                                ctx.scheduler.generate_mapped_id(cid, id.clone()).await?;
+                            tracing::debug!(%id, ?mapped_id, "Scan created");
                             Ok(resp)
                         }
                         Err(resp) => Ok(resp),
@@ -452,7 +473,7 @@ where
                 }
                 (&Method::GET, Scans(None)) => {
                     if ctx.enable_get_scans {
-                        match ctx.scheduler.get_scans_of_client_id(&cid).await {
+                        match ctx.scheduler.list_mapped_scan_ids(&cid).await {
                             Ok(scans) => Ok(ctx.response.ok(&scans)),
                             Err(e) => Ok(ctx.response.internal_server_error(&e)),
                         }
@@ -471,7 +492,7 @@ where
                             .ok_static(preference::PREFERENCES_JSON.as_bytes()))
                     }
                 }
-                (&Method::GET, Scans(Some(id))) => match ctx.scheduler.get_scan(&id).await {
+                (&Method::GET, Scans(Some(_))) => match ctx.scheduler.get_scan(&mapped_id).await {
                     Ok((mut scan, _)) => {
                         let credentials = scan
                             .target
@@ -486,29 +507,29 @@ where
                         Ok(ctx.response.ok(&scan))
                     }
                     Err(crate::storage::Error::NotFound) => {
-                        Ok(ctx.response.not_found("scans", &id))
+                        Ok(ctx.response.not_found("scans", &mapped_id))
                     }
                     Err(e) => Ok(ctx.response.internal_server_error(&e)),
                 },
-                (&Method::GET, ScanStatus(id)) => match ctx.scheduler.get_scan(&id).await {
+                (&Method::GET, ScanStatus(_)) => match ctx.scheduler.get_scan(&mapped_id).await {
                     Ok((_, status)) => Ok(ctx.response.ok(&status)),
                     Err(crate::storage::Error::NotFound) => {
-                        Ok(ctx.response.not_found("scans/status", &id))
+                        Ok(ctx.response.not_found("scans/status", &mapped_id))
                     }
                     Err(e) => Ok(ctx.response.internal_server_error(&e)),
                 },
-                (&Method::DELETE, Scans(Some(id))) => {
-                    match ctx.scheduler.delete_scan_by_id(&id).await {
+                (&Method::DELETE, Scans(Some(_))) => {
+                    match ctx.scheduler.delete_scan_by_id(&mapped_id).await {
                         Ok(_) => Ok(ctx.response.no_content()),
                         Err(crate::scheduling::Error::NotFound) => {
-                            Ok(ctx.response.not_found("scans", &id))
+                            Ok(ctx.response.not_found("scans", &mapped_id))
                         }
                         Err(e) => Err(e.into()),
                     }
                 }
-                (&Method::GET, ScanResults(id, rid)) => {
+                (&Method::GET, ScanResults(_, index)) => {
                     let (begin, end) = {
-                        if let Some(id) = rid {
+                        if let Some(id) = index {
                             match id.parse::<usize>() {
                                 Ok(id) => (Some(id), Some(id + 1)),
                                 Err(_) => (None, None),
@@ -531,10 +552,10 @@ where
                         }
                     };
 
-                    match ctx.scheduler.get_results(&id, begin, end).await {
+                    match ctx.scheduler.get_results(&mapped_id, begin, end).await {
                         Ok(results) => Ok(ctx.response.byte_stream(StatusCode::OK, results).await),
                         Err(crate::storage::Error::NotFound) => {
-                            Ok(ctx.response.not_found("scans/results", &id))
+                            Ok(ctx.response.not_found("scans/results", &mapped_id))
                         }
                         Err(e) => Ok(ctx.response.internal_server_error(&e)),
                     }
@@ -578,9 +599,7 @@ pub mod client {
     };
     use scannerlib::models::{self, Action, Scan, ScanAction, Status};
     use scannerlib::nasl::FSPluginLoader;
-    use scannerlib::storage::infisto::{
-        CachedIndexFileStorer, ChaCha20IndexFileStorer, IndexedFileStorer,
-    };
+    use scannerlib::storage::infisto::{ChaCha20IndexFileStorer, IndexedFileStorer};
     use serde::Deserialize;
 
     use crate::storage::inmemory;
@@ -602,7 +621,7 @@ pub mod client {
     /// A fake implementation of the ScannerStack trait.
     ///
     /// This is useful for testing the Scanner implementation.
-    pub struct LambdaScannerBuilder {
+    struct LambdaScannerBuilder {
         start_scan: StartScan,
         can_start_scan: CanStartScan,
         stop_scan: StopScan,
@@ -617,7 +636,7 @@ pub mod client {
     }
 
     impl LambdaScannerBuilder {
-        pub fn new() -> Self {
+        fn new() -> Self {
             Self {
                 start_scan: Arc::new(Box::new(|_| Ok(()))),
                 can_start_scan: Arc::new(Box::new(|_| true)),
@@ -627,39 +646,7 @@ pub mod client {
             }
         }
 
-        pub fn with_start_scan<F>(mut self, f: F) -> Self
-        where
-            F: Fn(Scan) -> Result<(), Error> + Send + Sync + 'static,
-        {
-            self.start_scan = Arc::new(Box::new(f));
-            self
-        }
-
-        pub fn with_can_start_scan<F>(mut self, f: F) -> Self
-        where
-            F: Fn(&Scan) -> bool + Send + Sync + 'static,
-        {
-            self.can_start_scan = Arc::new(Box::new(f));
-            self
-        }
-
-        pub fn with_stop_scan<F>(mut self, f: F) -> Self
-        where
-            F: Fn(&str) -> Result<(), Error> + Send + Sync + 'static,
-        {
-            self.stop_scan = Arc::new(Box::new(f));
-            self
-        }
-
-        pub fn with_delete_scan<F>(mut self, f: F) -> Self
-        where
-            F: Fn(&str) -> Result<(), Error> + Send + Sync + 'static,
-        {
-            self.delete_scan = Arc::new(Box::new(f));
-            self
-        }
-
-        pub fn with_fetch_results<F>(mut self, f: F) -> Self
+        fn with_fetch_results<F>(mut self, f: F) -> Self
         where
             F: Fn(&str) -> Result<super::ScanResults, Error> + Send + Sync + 'static,
         {
@@ -667,7 +654,7 @@ pub mod client {
             self
         }
 
-        pub fn build(self) -> LambdaScanner {
+        fn build(self) -> LambdaScanner {
             LambdaScanner {
                 start_scan: self.start_scan,
                 can_start_scan: self.can_start_scan,
@@ -818,30 +805,12 @@ pub mod client {
         Client::authenticated(scanner, storage)
     }
 
-    pub async fn file_based_example_feed(
-        prefix: &str,
-    ) -> Client<
-        scannerlib::scanner::Scanner<(
-            Arc<ResultCatcher<Storage<CachedIndexFileStorer>>>,
-            FSPluginLoader,
-        )>,
-        Arc<ResultCatcher<Storage<CachedIndexFileStorer>>>,
-    > {
-        use crate::file::tests::{example_feed_file_storage, nasl_root};
-        let storage_dir = format!("/tmp/openvasd/{prefix}_{}", uuid::Uuid::new_v4());
-        let store = example_feed_file_storage(&storage_dir).await;
-        let store = Arc::new(ResultCatcher::new(store));
-        let nasl_feed_path = nasl_root().await;
-        let scanner = scannerlib::scanner::Scanner::with_storage(store.clone(), &nasl_feed_path);
-        Client::authenticated(scanner, store)
-    }
-
     impl<S, DB> Client<S, DB>
     where
         S: Scanner + 'static + std::marker::Send + std::marker::Sync,
         DB: crate::storage::Storage + 'static + std::marker::Send + std::marker::Sync,
     {
-        pub fn authenticated(scanner: S, db: DB) -> Self {
+        fn authenticated(scanner: S, db: DB) -> Self {
             let ns = crate::config::Scheduler {
                 check_interval: std::time::Duration::from_nanos(10),
                 ..Default::default()
@@ -911,7 +880,7 @@ pub mod client {
             self.entrypoint(req).await
         }
 
-        pub async fn scan_status(&self, id: &str) -> TypeResult<Status> {
+        async fn scan_status(&self, id: &str) -> TypeResult<Status> {
             let result = self
                 .request_empty(Method::GET, KnownPaths::ScanStatus(id.to_string()))
                 .await;
@@ -949,7 +918,7 @@ pub mod client {
             self.no_content(result).await
         }
 
-        pub async fn scan_action(&self, id: &str, action: Action) -> TypeResult<()> {
+        async fn scan_action(&self, id: &str, action: Action) -> TypeResult<()> {
             let action: ScanAction = action.into();
             let result = self
                 .request_json(
@@ -961,7 +930,7 @@ pub mod client {
             self.no_content(result).await
         }
 
-        pub async fn no_content(&self, result: HttpResult) -> TypeResult<()> {
+        async fn no_content(&self, result: HttpResult) -> TypeResult<()> {
             let resp = result?;
             if resp.status() != 204 {
                 return Err(scanner::Error::Unexpected(format!(
@@ -970,13 +939,6 @@ pub mod client {
                 )));
             }
             Ok(())
-        }
-
-        pub async fn scans(&self) -> TypeResult<Vec<Scan>> {
-            let result = self
-                .request_empty(Method::GET, KnownPaths::Scans(None))
-                .await;
-            self.parsed(result, StatusCode::OK).await
         }
 
         // TODO: deal with that static stuff that prevents deserializiation based on Bytes
@@ -1041,7 +1003,7 @@ pub mod client {
             }
         }
 
-        pub async fn parsed<'a, T>(
+        async fn parsed<'a, T>(
             &self,
             result: HttpResult,
             expected_status: StatusCode,

@@ -38,7 +38,7 @@ impl Channel {
             .map_err(|e| SshErrorKind::OpenSession.with(self.session_id).with(e))
     }
 
-    pub fn is_closed(&self) -> bool {
+    fn is_closed(&self) -> bool {
         self.channel.is_closed()
     }
 
@@ -105,7 +105,7 @@ impl Channel {
     pub fn read_ssh_blocking(&self, timeout: Duration) -> Result<String> {
         let stderr = self.read_timeout(timeout, true)?;
         let stdout = self.read_timeout(timeout, false)?;
-        Ok(format!("{}{}", stderr, stdout))
+        Ok(format!("{stderr}{stdout}"))
     }
 
     fn read_nonblocking(&self, stderr: bool) -> Result<String> {
@@ -126,6 +126,6 @@ impl Channel {
 
         let stderr = self.read_nonblocking(true)?;
         let stdout = self.read_nonblocking(false)?;
-        Ok(format!("{}{}", stderr, stdout))
+        Ok(format!("{stderr}{stdout}"))
     }
 }

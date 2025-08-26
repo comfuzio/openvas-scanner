@@ -11,13 +11,13 @@ use std::{
 
 use super::{
     PacketForgeryError, RawIpError,
-    raw_ip_utils::{get_interface_by_local_ip, get_source_ip, islocalhost},
+    raw_ip_utils::{ChecksumCalculator, get_interface_by_local_ip, get_source_ip, islocalhost},
 };
 
-use crate::nasl::builtin::misc::random_impl;
+use crate::nasl::NaslValue;
 use crate::nasl::prelude::*;
-use crate::nasl::syntax::NaslValue;
-use crate::nasl::utils::NaslVars;
+use crate::nasl::utils::DefineGlobalVars;
+use crate::nasl::{builtin::misc::random_impl, utils::function::utils::DEFAULT_TIMEOUT};
 
 use pcap::Capture;
 use pnet::packet::{
@@ -39,7 +39,6 @@ use pnet::packet::{
     udp::{MutableUdpPacket, UdpPacket},
 };
 
-use pnet_macros_support::types::u9be;
 use socket2::{Domain, Protocol, Socket};
 use tracing::debug;
 
@@ -53,8 +52,6 @@ macro_rules! custom_error {
     };
 }
 
-/// Default Timeout for received
-const DEFAULT_TIMEOUT_SEC: i32 = 5;
 /// Define IPPROTO_RAW
 const IPPROTO_RAW: i32 = 255;
 /// Define IPPROTO_IP for dummy tcp . From rfc3542:
@@ -90,7 +87,7 @@ const DEFAULT_IPV4_HEADER_LENGTH_32BIT_INCREMENTS: u8 = 5;
 const DEFAULT_TCP_DATA_OFFSET_32BIT_INCREMENTS: u8 = 5;
 /// Default ttl value is inherit from NASL C
 const DEFAULT_TTL: u8 = 0x40;
-const TH_SYN: u16 = 0x02;
+const TH_SYN: u8 = 0x02;
 
 #[derive(Default)]
 struct PacketPayload {
@@ -206,7 +203,7 @@ impl<'a> FromNaslValue<'a> for Ipv4Addr {
         match addr.parse::<Ipv4Addr>() {
             Ok(ip_addr) => Ok(ip_addr),
             Err(e) => Err(ArgumentError::WrongArgument(
-                format!("Expected a valid IPv4 address. {}.", e).to_string(),
+                format!("Expected a valid IPv4 address. {e}.").to_string(),
             )
             .into()),
         }
@@ -219,7 +216,7 @@ impl<'a> FromNaslValue<'a> for Ipv6Addr {
         match addr.parse::<Ipv6Addr>() {
             Ok(ip_addr) => Ok(ip_addr),
             Err(e) => Err(ArgumentError::WrongArgument(
-                format!("Expected a valid IPv6 address. {}.", e).to_string(),
+                format!("Expected a valid IPv6 address. {e}.").to_string(),
             )
             .into()),
         }
@@ -227,7 +224,7 @@ impl<'a> FromNaslValue<'a> for Ipv6Addr {
 }
 
 /// print the raw packet
-pub fn display_packet(vector: &[u8]) {
+fn display_packet(vector: &[u8]) {
     let mut s: String = "\n".to_string();
     let mut count = 0;
 
@@ -244,68 +241,8 @@ pub fn display_packet(vector: &[u8]) {
     println!("packet = {}", &s);
 }
 
-trait ChecksumCalculator<'a, V: 'a> {
-    fn calculate_checksum(&self, chksum: Option<u16>, pkt: &'a V) -> u16;
-}
-
-impl<'a> ChecksumCalculator<'a, Ipv4Packet<'a>> for MutableUdpPacket<'a> {
-    fn calculate_checksum(&self, chksum: Option<u16>, pkt: &'a Ipv4Packet) -> u16 {
-        let chksum = chksum.unwrap_or(0);
-        if chksum != 0 {
-            return chksum.to_be();
-        }
-        pnet::packet::udp::ipv4_checksum(
-            &self.to_immutable(),
-            &pkt.get_source(),
-            &pkt.get_destination(),
-        )
-    }
-}
-
-impl<'a> ChecksumCalculator<'a, Ipv4Packet<'a>> for MutableTcpPacket<'a> {
-    fn calculate_checksum(&self, chksum: Option<u16>, pkt: &'a Ipv4Packet) -> u16 {
-        let chksum = chksum.unwrap_or(0);
-        if chksum != 0 {
-            return chksum.to_be();
-        }
-        pnet::packet::tcp::ipv4_checksum(
-            &self.to_immutable(),
-            &pkt.get_source(),
-            &pkt.get_destination(),
-        )
-    }
-}
-
-impl<'a> ChecksumCalculator<'a, Ipv6Packet<'a>> for MutableUdpPacket<'a> {
-    fn calculate_checksum(&self, chksum: Option<u16>, pkt: &'a Ipv6Packet) -> u16 {
-        let chksum = chksum.unwrap_or(0);
-        if chksum != 0 {
-            return chksum.to_be();
-        }
-        pnet::packet::udp::ipv6_checksum(
-            &self.to_immutable(),
-            &pkt.get_source(),
-            &pkt.get_destination(),
-        )
-    }
-}
-
-impl<'a> ChecksumCalculator<'a, Ipv6Packet<'a>> for MutableTcpPacket<'a> {
-    fn calculate_checksum(&self, chksum: Option<u16>, pkt: &'a Ipv6Packet) -> u16 {
-        let chksum = chksum.unwrap_or(0);
-        if chksum != 0 {
-            return chksum.to_be();
-        }
-        pnet::packet::tcp::ipv6_checksum(
-            &self.to_immutable(),
-            &pkt.get_source(),
-            &pkt.get_destination(),
-        )
-    }
-}
-
 /// Copy from a slice in safe way, performing the necessary test to avoid panicking
-pub fn safe_copy_from_slice(
+fn safe_copy_from_slice(
     d_buf: &mut [u8],
     d_init: usize,
     d_fin: usize,
@@ -349,7 +286,7 @@ pub fn safe_copy_from_slice(
     data, ip_hl, ip_v, ip_tos, ip_ttl, ip_id, ip_len, ip_off, ip_p, ip_src, ip_dst, ip_sum
 ))]
 fn forge_ip_packet(
-    configs: &Context,
+    configs: &ScanCtx,
     data: Option<PacketPayload>,
     ip_hl: Option<u8>,
     ip_v: Option<u8>,
@@ -406,7 +343,7 @@ fn forge_ip_packet(
     Ok(NaslValue::Data(buf))
 }
 
-pub enum IpElement {
+enum IpElement {
     HeaderLength,
     Id,
     IpLen,
@@ -436,8 +373,7 @@ impl FromStr for IpElement {
             "ip_src" => Ok(IpElement::SourceAddress),
             "ip_dst" => Ok(IpElement::DestinationAddress),
             s => Err(ArgumentError::WrongArgument(format!(
-                "Invalid element for IP packet: {}",
-                s
+                "Invalid element for IP packet: {s}"
             ))),
         }
     }
@@ -537,7 +473,7 @@ fn set_ip_elements(
                 pkt.set_source(ip);
             }
             Err(e) => {
-                return Err(ArgumentError::WrongArgument(format!("Invalid ip_src: {}", e)).into());
+                return Err(ArgumentError::WrongArgument(format!("Invalid ip_src: {e}")).into());
             }
         };
     };
@@ -578,7 +514,7 @@ fn dump_protocol(pkt: &Ipv4Packet) -> String {
         IpNextHeaderProtocols::Udp => "IPPROTO_UDP",
         _ => "IPPROTO_ICMP",
     };
-    format!("{} ({})", protocol_name, byte)
+    format!("{protocol_name} ({byte})")
 }
 
 /// Receive a list of IP packets and print them in a readable format in the screen.
@@ -679,7 +615,7 @@ fn forge_tcp(
     th_ack: Option<u32>,
     th_x2: Option<u8>,
     th_offset: Option<u8>,
-    th_flags: Option<u16>,
+    th_flags: Option<u8>,
     th_win: Option<u16>,
     th_urp: Option<u16>,
 ) -> Vec<u8> {
@@ -698,7 +634,7 @@ fn forge_tcp(
     tcp_seg.set_acknowledgement(th_ack.unwrap_or(0_u32));
     tcp_seg.set_reserved(th_x2.unwrap_or(0_u8));
     tcp_seg.set_data_offset(th_offset.unwrap_or(5_u8));
-    tcp_seg.set_flags(th_flags.unwrap_or(0_u16));
+    tcp_seg.set_flags(th_flags.unwrap_or(0_u8));
     tcp_seg.set_window(th_win.unwrap_or(0_u16));
     tcp_seg.set_urgent_ptr(th_urp.unwrap_or(0_u16));
 
@@ -747,7 +683,7 @@ fn forge_tcp_packet(
     th_ack: Option<u32>,
     th_x2: Option<u8>,
     th_off: Option<u8>,
-    th_flags: Option<u16>,
+    th_flags: Option<u8>,
     th_win: Option<u16>,
     th_urp: Option<u16>,
     th_sum: Option<u16>,
@@ -814,8 +750,7 @@ impl FromStr for TcpElement {
             "th_urp" => Ok(Self::Urp),
             "data" => Ok(Self::Data),
             s => Err(ArgumentError::WrongArgument(format!(
-                "Invalid element for TCP packet: {}",
-                s
+                "Invalid element for TCP packet: {s}"
             ))),
         }
     }
@@ -889,8 +824,7 @@ impl TryFrom<i64> for TcpOpt {
             4 => Ok(Self::SackPermitted),
             8 => Ok(Self::Timestamp),
             opt => Err(ArgumentError::WrongArgument(format!(
-                "Invalid TCP Option value: {}",
-                opt
+                "Invalid TCP Option value: {opt}"
             ))),
         }
     }
@@ -969,7 +903,7 @@ fn set_elements_tcp<'a>(
     th_ack: Option<u32>,
     th_x2: Option<u8>,
     th_off: Option<u8>,
-    th_flags: Option<u16>,
+    th_flags: Option<u8>,
     th_urp: Option<u16>,
     th_win: Option<u16>,
     new_buf: &'a mut Vec<u8>,
@@ -1078,7 +1012,7 @@ fn set_tcp_elements(
     th_ack: Option<u32>,
     th_x2: Option<u8>,
     th_off: Option<u8>,
-    th_flags: Option<u16>,
+    th_flags: Option<u8>,
     th_urp: Option<u16>,
     th_sum: Option<u16>,
     th_win: Option<u16>,
@@ -1303,7 +1237,7 @@ fn display_opts(pkt: &TcpPacket) {
             _ => None,
         };
         if let Some(name) = name {
-            println!("\t\t{}: {:?}", name, p);
+            println!("\t\t{name}: {p:?}");
         }
     }
 }
@@ -1311,7 +1245,7 @@ fn display_opts(pkt: &TcpPacket) {
 fn format_flags(pkt: &TcpPacket) -> String {
     let flags = pkt.get_flags();
     let mut flag_strs = vec![];
-    let mut check_flag = |flag: u9be, name: &str| {
+    let mut check_flag = |flag: u8, name: &str| {
         if flags & flag == flag {
             flag_strs.push(name.to_owned());
         }
@@ -1338,7 +1272,7 @@ fn print_tcp_packet(tcp: &TcpPacket) {
     println!("\tth_ack = {}", tcp.get_acknowledgement());
     println!("\tth_x2 = {}", tcp.get_reserved());
     println!("\tth_off = {}", tcp.get_data_offset());
-    println!("\tth_flags = {}", th_flags);
+    println!("\tth_flags = {th_flags}");
     println!("\tth_win = {}", tcp.get_window());
     println!("\tth_sum = {}", tcp.get_checksum());
     println!("\tth_urp = {}", tcp.get_urgent_ptr());
@@ -1551,8 +1485,7 @@ impl FromStr for UdpElement {
             "uh_sum" => Ok(Self::Checksum),
             "data" => Ok(Self::Data),
             s => Err(ArgumentError::WrongArgument(format!(
-                "Invalid element for UDP packet: {}",
-                s
+                "Invalid element for UDP packet: {s}"
             ))),
         }
     }
@@ -1699,8 +1632,7 @@ impl FromStr for IcmpElement {
             "icmp_chsum" => Ok(Self::CheckSum),
             "icmp_data" => Ok(Self::Data),
             s => Err(ArgumentError::WrongArgument(format!(
-                "Invalid element for ICMP packet: {}",
-                s
+                "Invalid element for ICMP packet: {s}"
             ))),
         }
     }
@@ -1798,7 +1730,7 @@ fn dump_icmp_packet(positional: CheckedPositionals<Ipv4Packet>) -> Result<NaslVa
 // here should be reasonably safe.
 // https://github.com/libpnet/libpnet/blob/a01aa493e2ecead4c45e7322b6c5f7ab29e8a985/pnet_macros/src/decorator.rs#L1138
 #[allow(unexpected_cfgs)]
-pub mod igmp {
+mod igmp {
     use std::net::Ipv4Addr;
 
     use pnet::packet::{Packet, PrimitiveValues};
@@ -1810,7 +1742,7 @@ pub mod igmp {
 
     /// Represents the "IGMP type" header field.
     #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-    pub struct IgmpType(pub u8);
+    pub struct IgmpType(u8);
 
     impl IgmpType {
         /// Create a new `IgmpType` instance.
@@ -1849,15 +1781,15 @@ pub mod igmp {
     pub mod IgmpTypes {
         use super::IgmpType;
         /// IGMP type for "Membership Query"
-        pub const MembershipQuery: IgmpType = IgmpType(0x11);
+        const MembershipQuery: IgmpType = IgmpType(0x11);
         /// IGMP type for "IGMPv1 Membership Report"
-        pub const IGMPv1MembershipReport: IgmpType = IgmpType(0x12);
+        const IGMPv1MembershipReport: IgmpType = IgmpType(0x12);
         /// IGMP type for "IGMPv2 Membership Report"
-        pub const IGMPv2MembershipReport: IgmpType = IgmpType(0x16);
+        const IGMPv2MembershipReport: IgmpType = IgmpType(0x16);
         /// IGMP type for "IGMPv3 Membership Report"
-        pub const IGMPv3MembershipReport: IgmpType = IgmpType(0x22);
+        const IGMPv3MembershipReport: IgmpType = IgmpType(0x22);
         /// IGMP type for Leave Group"
-        pub const LeaveGroup: IgmpType = IgmpType(0x17);
+        const LeaveGroup: IgmpType = IgmpType(0x17);
         /// OpenVAS IGMP default type
         pub const Default: IgmpType = IgmpType(0x00);
     }
@@ -1892,10 +1824,8 @@ fn forge_igmp_packet(
     let mut igmp_pkt = igmp::MutableIgmpPacket::new(&mut buf).unwrap();
 
     // use register since type is codeword
-    match register.named("type") {
-        Some(ContextType::Value(NaslValue::Number(x))) => {
-            igmp_pkt.set_igmp_type(igmp::IgmpType::new(*x as u8))
-        }
+    match register.nasl_value("type") {
+        Ok(NaslValue::Number(x)) => igmp_pkt.set_igmp_type(igmp::IgmpType::new(*x as u8)),
         _ => igmp_pkt.set_igmp_type(igmp::IgmpTypes::Default),
     };
     igmp_pkt.set_igmp_timeout(code.unwrap_or(0u8));
@@ -1929,7 +1859,7 @@ fn new_raw_socket() -> Result<Socket, FnError> {
         Some(Protocol::from(IPPROTO_RAW)),
     ) {
         Ok(s) => Ok(s),
-        Err(e) => Err(error(format!("Not possible to create a raw socket: {}", e))),
+        Err(e) => Err(error(format!("Not possible to create a raw socket: {e}"))),
     }
 }
 
@@ -1941,18 +1871,16 @@ fn new_raw_ipv6_socket() -> Result<Socket, FnError> {
     )
     .map_err(|e| {
         error(format!(
-            "new_raw_ipv6_socket: Not possible to create a raw socket: {}",
-            e
+            "new_raw_ipv6_socket: Not possible to create a raw socket: {e}"
         ))
     })
 }
 
-/// This function tries to open a TCP connection and sees if anything comes back (SYN/ACK or RST).
-///
-/// Its argument is:
-/// - port: port for the ping
-#[nasl_function(named(port))]
-fn nasl_tcp_ping(configs: &Context, port: Option<u16>) -> Result<NaslValue, FnError> {
+pub fn nasl_tcp_ping_shared(configs: &ScanCtx, port: Option<u16>) -> Result<NaslValue, FnError> {
+    if configs.target().ip_addr().is_ipv6() {
+        return nasl_tcp_v6_ping_shared(configs, port);
+    }
+
     let rnd_tcp_port = || -> u16 { (random_impl().unwrap_or(0) % 65535 + 1024) as u16 };
 
     let sports_ori: Vec<u16> = vec![
@@ -1974,16 +1902,14 @@ fn nasl_tcp_ping(configs: &Context, port: Option<u16>) -> Result<NaslValue, FnEr
 
     let soc = new_raw_socket()?;
     if let Err(e) = soc.set_header_included_v4(true) {
-        return Err(error(format!("Not possible to create a raw socket: {}", e)));
+        return Err(error(format!("Not possible to create a raw socket: {e}")));
     };
 
     // Get the iface name, to set the capture device.
     let target_ip = configs.target().ip_addr();
     let local_ip = get_source_ip(target_ip)?;
     let iface = get_interface_by_local_ip(local_ip)?;
-
-    //TODO!: implement plug_get_host_open_port() to get the default port
-    let port = port.unwrap_or(0u16);
+    let port = port.unwrap_or(configs.get_random_open_tcp_port().unwrap_or_default());
 
     if islocalhost(target_ip) {
         return Ok(NaslValue::Number(1));
@@ -1996,7 +1922,7 @@ fn nasl_tcp_ping(configs: &Context, port: Option<u16>) -> Result<NaslValue, FnEr
         },
         Err(e) => return custom_error!("send_packet: {}", e),
     };
-    let filter = format!("ip and src host {}", target_ip);
+    let filter = format!("ip and src host {target_ip}");
 
     let mut ip_buf = [0u8; 40];
     let mut ip = MutableIpv4Packet::new(&mut ip_buf)
@@ -2030,7 +1956,6 @@ fn nasl_tcp_ping(configs: &Context, port: Option<u16>) -> Result<NaslValue, FnEr
     tcp.set_urgent_ptr(0);
 
     for (i, _) in sports.iter().enumerate() {
-        // TODO!: the port is fixed since the function to get open ports is not implemented.
         let mut sport = rnd_tcp_port();
         let mut dport = port;
         if port == 0 {
@@ -2051,7 +1976,7 @@ fn nasl_tcp_ping(configs: &Context, port: Option<u16>) -> Result<NaslValue, FnEr
                 debug!("Sent {} bytes", b);
             }
             Err(e) => {
-                return Err(error(format!("send_packet: {}", e)));
+                return Err(error(format!("send_packet: {e}")));
             }
         }
 
@@ -2068,6 +1993,15 @@ fn nasl_tcp_ping(configs: &Context, port: Option<u16>) -> Result<NaslValue, FnEr
     Ok(NaslValue::Null)
 }
 
+/// This function tries to open a TCP connection and sees if anything comes back (SYN/ACK or RST).
+///
+/// Its argument is:
+/// - port: port for the ping
+#[nasl_function(named(port))]
+fn nasl_tcp_ping(configs: &ScanCtx, port: Option<u16>) -> Result<NaslValue, FnError> {
+    nasl_tcp_ping_shared(configs, port)
+}
+
 /// Send a list of packets, passed as unnamed arguments, with the option to listen to the answers.
 ///
 /// The arguments are:
@@ -2079,7 +2013,7 @@ fn nasl_tcp_ping(configs: &Context, port: Option<u16>) -> Result<NaslValue, FnEr
 /// - allow_broadcast: default FALSE
 #[nasl_function(named(length, pcap_active, pcap_filter, pcap_timeout, allow_broadcast))]
 fn nasl_send_packet(
-    configs: &Context,
+    configs: &ScanCtx,
     length: Option<i32>,
     pcap_active: Option<bool>,
     pcap_filter: Option<String>,
@@ -2089,7 +2023,7 @@ fn nasl_send_packet(
 ) -> Result<NaslValue, FnError> {
     let use_pcap = pcap_active.unwrap_or(true);
     let filter = pcap_filter.unwrap_or_default();
-    let timeout = pcap_timeout.unwrap_or(DEFAULT_TIMEOUT_SEC) * 1000;
+    let timeout = pcap_timeout.unwrap_or(DEFAULT_TIMEOUT) * 1000;
     let mut allow_broadcast = allow_broadcast.unwrap_or(false);
 
     if positional.is_empty() {
@@ -2099,7 +2033,7 @@ fn nasl_send_packet(
     let soc = new_raw_socket()?;
 
     if let Err(e) = soc.set_header_included_v4(true) {
-        return Err(error(format!("Not possible to create a raw socket: {}", e)));
+        return Err(error(format!("Not possible to create a raw socket: {e}")));
     };
 
     let _dflt_packet_sz = length.unwrap_or_default();
@@ -2172,14 +2106,14 @@ fn nasl_send_packet(
 /// - timeout: timeout in seconds, 5 by default
 #[nasl_function(named(interface, pcap_filter, timeout))]
 fn nasl_send_capture(
-    configs: &Context,
+    configs: &ScanCtx,
     interface: Option<String>,
     pcap_filter: Option<String>,
     timeout: Option<i32>,
 ) -> Result<NaslValue, FnError> {
     let interface = interface.unwrap_or_default();
     let filter = pcap_filter.unwrap_or_default();
-    let timeout = timeout.unwrap_or(DEFAULT_TIMEOUT_SEC) * 1000;
+    let timeout = timeout.unwrap_or(DEFAULT_TIMEOUT) * 1000;
 
     // Get the iface name, to set the capture device.
     let target_ip = configs.target().ip_addr();
@@ -2230,7 +2164,7 @@ fn nasl_send_capture(
 /// Return an IPv6 datagram or Null on error.
 #[nasl_function(named(data, ip6_v, ip6_tc, ip6_fl, ip6_p, ip6_hlim, ip6_src, ip6_dst))]
 fn forge_ip_v6_packet(
-    configs: &Context,
+    configs: &ScanCtx,
     data: Option<PacketPayload>,
     ip6_v: Option<u8>,
     ip6_tc: Option<u8>,
@@ -2276,7 +2210,7 @@ fn forge_ip_v6_packet(
                 pkt.set_destination(ip);
             }
             Err(e) => {
-                return Err(ArgumentError::WrongArgument(format!("Invalid ip: {}", e)).into());
+                return Err(ArgumentError::WrongArgument(format!("Invalid ip: {e}")).into());
             }
         };
     };
@@ -2310,8 +2244,7 @@ impl FromStr for Ipv6Element {
             "ip6_src" => Ok(Ipv6Element::Source),
             "ip6_dst" => Ok(Ipv6Element::Destination),
             s => Err(ArgumentError::WrongArgument(format!(
-                "Invalid element for IPv6 packet: {}",
-                s
+                "Invalid element for IPv6 packet: {s}"
             ))),
         }
     }
@@ -2533,7 +2466,7 @@ fn forge_tcp_v6_packet(
     th_ack: Option<u32>,
     th_x2: Option<u8>,
     th_off: Option<u8>,
-    th_flags: Option<u16>,
+    th_flags: Option<u8>,
     th_win: Option<u16>,
     th_urp: Option<u16>,
     th_sum: Option<u16>,
@@ -2600,7 +2533,7 @@ fn set_tcp_v6_elements(
     th_ack: Option<u32>,
     th_x2: Option<u8>,
     th_off: Option<u8>,
-    th_flags: Option<u16>,
+    th_flags: Option<u8>,
     th_urp: Option<u16>,
     th_sum: Option<u16>,
     th_win: Option<u16>,
@@ -3035,8 +2968,7 @@ impl FromStr for Icmpv6Element {
             "icmp_chsum" => Ok(Self::CheckSum),
             "icmp_data" => Ok(Self::Data),
             s => Err(ArgumentError::WrongArgument(format!(
-                "Invalid element for ICMP packet: {}",
-                s
+                "Invalid element for ICMP packet: {s}"
             ))),
         }
     }
@@ -3146,12 +3078,7 @@ fn forge_igmp_v6_packet() -> Result<NaslValue, FnError> {
     Ok(NaslValue::Null)
 }
 
-/// This function tries to open a TCP connection and sees if anything comes back (SYN/ACK or RST).
-///
-/// Its argument is:
-/// - port: port for the ping
-#[nasl_function(named(port))]
-fn nasl_tcp_v6_ping(configs: &Context, port: Option<u16>) -> Result<NaslValue, FnError> {
+fn nasl_tcp_v6_ping_shared(configs: &ScanCtx, port: Option<u16>) -> Result<NaslValue, FnError> {
     let rnd_tcp_port = || -> u16 { (random_impl().unwrap_or(0) % 65535 + 1024) as u16 };
 
     let sports_ori: Vec<u16> = vec![
@@ -3173,7 +3100,7 @@ fn nasl_tcp_v6_ping(configs: &Context, port: Option<u16>) -> Result<NaslValue, F
 
     let soc = new_raw_ipv6_socket()?;
     if let Err(e) = soc.set_header_included_v6(true) {
-        return Err(error(format!("Not possible to create a raw socket: {}", e)));
+        return Err(error(format!("Not possible to create a raw socket: {e}")));
     };
 
     // Get the iface name, to set the capture device.
@@ -3181,7 +3108,7 @@ fn nasl_tcp_v6_ping(configs: &Context, port: Option<u16>) -> Result<NaslValue, F
     let local_ip = get_source_ip(target_ip)?;
     let iface = get_interface_by_local_ip(local_ip)?;
 
-    let port = port.unwrap_or_default();
+    let port = port.unwrap_or(configs.get_random_open_tcp_port().unwrap_or_default());
 
     if islocalhost(target_ip) {
         return Ok(NaslValue::Number(1));
@@ -3194,7 +3121,7 @@ fn nasl_tcp_v6_ping(configs: &Context, port: Option<u16>) -> Result<NaslValue, F
         },
         Err(e) => return custom_error!("send_packet: {}", e),
     };
-    let filter = format!("ip and src host {}", target_ip);
+    let filter = format!("ip and src host {target_ip}");
 
     let mut ip_buf = [0u8; FIX_IPV6_HEADER_LENGTH];
     let mut ip = MutableIpv6Packet::new(&mut ip_buf)
@@ -3223,7 +3150,6 @@ fn nasl_tcp_v6_ping(configs: &Context, port: Option<u16>) -> Result<NaslValue, F
     tcp.set_urgent_ptr(0);
 
     for (i, _) in sports.iter().enumerate() {
-        // TODO!: the port is fixed since the function to get open ports is not implemented.
         let mut sport = rnd_tcp_port();
         let mut dport = port;
         if port == 0 {
@@ -3243,7 +3169,7 @@ fn nasl_tcp_v6_ping(configs: &Context, port: Option<u16>) -> Result<NaslValue, F
                 debug!("Sent {} bytes", b);
             }
             Err(e) => {
-                return Err(error(format!("send_packet: {}", e)));
+                return Err(error(format!("send_packet: {e}")));
             }
         }
 
@@ -3259,6 +3185,15 @@ fn nasl_tcp_v6_ping(configs: &Context, port: Option<u16>) -> Result<NaslValue, F
     Ok(NaslValue::Null)
 }
 
+/// This function tries to open a TCP connection and sees if anything comes back (SYN/ACK or RST).
+///
+/// Its argument is:
+/// - port: port for the ping
+#[nasl_function(named(port))]
+fn nasl_tcp_v6_ping(configs: &ScanCtx, port: Option<u16>) -> Result<NaslValue, FnError> {
+    nasl_tcp_v6_ping_shared(configs, port)
+}
+
 /// Send a list of packets, passed as unnamed arguments, with the option to listen to the answers.
 ///
 /// The arguments are:
@@ -3270,7 +3205,7 @@ fn nasl_tcp_v6_ping(configs: &Context, port: Option<u16>) -> Result<NaslValue, F
 /// - allow_broadcast: default FALSE
 #[nasl_function(named(length, pcap_active, pcap_filter, pcap_timeout))]
 fn nasl_send_v6packet(
-    configs: &Context,
+    configs: &ScanCtx,
     length: Option<i32>,
     pcap_active: Option<bool>,
     pcap_filter: Option<String>,
@@ -3279,7 +3214,7 @@ fn nasl_send_v6packet(
 ) -> Result<NaslValue, FnError> {
     let use_pcap = pcap_active.unwrap_or(true);
     let filter = pcap_filter.unwrap_or_default();
-    let timeout = pcap_timeout.unwrap_or(DEFAULT_TIMEOUT_SEC) * 1000;
+    let timeout = pcap_timeout.unwrap_or(DEFAULT_TIMEOUT) * 1000;
 
     if positional.is_empty() {
         return Ok(NaslValue::Null);
@@ -3289,8 +3224,7 @@ fn nasl_send_v6packet(
 
     if let Err(e) = soc.set_header_included_v6(true) {
         return Err(error(format!(
-            "send_v6packet: Not possible to create a raw socket: {}",
-            e
+            "send_v6packet: Not possible to create a raw socket: {e}"
         )));
     };
 
@@ -3324,7 +3258,7 @@ fn nasl_send_v6packet(
         let sockaddr = match SocketAddr::from_str(&sock_str) {
             Ok(addr) => socket2::SockAddr::from(addr),
             Err(e) => {
-                return Err(error(format!("send_packet: {}", e)));
+                return Err(error(format!("send_packet: {e}")));
             }
         };
 
@@ -3333,7 +3267,7 @@ fn nasl_send_v6packet(
                 debug!("Sent {} bytes", b);
             }
             Err(e) => {
-                return Err(error(format!("send_packet: {}", e)));
+                return Err(error(format!("send_packet: {e}")));
             }
         }
 
@@ -3350,59 +3284,6 @@ fn nasl_send_v6packet(
         }
     }
     Ok(NaslValue::Null)
-}
-
-/// Returns a NaslVars with all predefined variables which must be expose to nasl script
-pub fn expose_vars() -> NaslVars<'static> {
-    let builtin_vars: NaslVars = [
-        (
-            "IPPROTO_TCP",
-            NaslValue::Number(IpNextHeaderProtocols::Tcp.to_primitive_values().0.into()),
-        ),
-        (
-            "IPPROTO_UDP",
-            NaslValue::Number(IpNextHeaderProtocols::Udp.to_primitive_values().0.into()),
-        ),
-        (
-            "IPPROTO_ICMP",
-            NaslValue::Number(IpNextHeaderProtocols::Icmp.to_primitive_values().0.into()),
-        ),
-        (
-            "IPPROTO_IGMP",
-            NaslValue::Number(IpNextHeaderProtocols::Igmp.to_primitive_values().0.into()),
-        ),
-        ("IPPROTO_IP", NaslValue::Number(IPPROTO_IP.into())),
-        ("TH_FIN", NaslValue::Number(TcpFlags::FIN.into())),
-        ("TH_SYN", NaslValue::Number(TcpFlags::SYN.into())),
-        ("TH_RST", NaslValue::Number(TcpFlags::RST.into())),
-        ("TH_PUSH", NaslValue::Number(TcpFlags::PSH.into())),
-        ("TH_ACK", NaslValue::Number(TcpFlags::ACK.into())),
-        ("TH_URG", NaslValue::Number(TcpFlags::URG.into())),
-        ("IP_RF", NaslValue::Number(IP_RF)),
-        ("IP_DF", NaslValue::Number(IP_DF)),
-        ("IP_MF", NaslValue::Number(IP_MF)),
-        ("IP_OFFMASK", NaslValue::Number(IP_OFFMASK)),
-        (
-            "TCPOPT_MAXSEG",
-            NaslValue::Number(TcpOptionNumbers::MSS.to_primitive_values().0 as i64),
-        ),
-        (
-            "TCPOPT_WINDOW",
-            NaslValue::Number(TcpOptionNumbers::WSCALE.to_primitive_values().0 as i64),
-        ),
-        (
-            "TCPOPT_SACK_PERMITTED",
-            NaslValue::Number(TcpOptionNumbers::SACK_PERMITTED.to_primitive_values().0 as i64),
-        ),
-        (
-            "TCPOPT_TIMESTAMP",
-            NaslValue::Number(TcpOptionNumbers::TIMESTAMPS.to_primitive_values().0 as i64),
-        ),
-    ]
-    .iter()
-    .cloned()
-    .collect();
-    builtin_vars
 }
 
 pub struct PacketForgery;
@@ -3458,4 +3339,54 @@ function_set! {
         forge_igmp_v6_packet,
         (nasl_send_v6packet, "send_v6packet"),
     )
+}
+
+impl DefineGlobalVars for PacketForgery {
+    fn get_global_vars() -> Vec<(&'static str, NaslValue)> {
+        vec![
+            (
+                "IPPROTO_TCP",
+                NaslValue::Number(IpNextHeaderProtocols::Tcp.to_primitive_values().0.into()),
+            ),
+            (
+                "IPPROTO_UDP",
+                NaslValue::Number(IpNextHeaderProtocols::Udp.to_primitive_values().0.into()),
+            ),
+            (
+                "IPPROTO_ICMP",
+                NaslValue::Number(IpNextHeaderProtocols::Icmp.to_primitive_values().0.into()),
+            ),
+            (
+                "IPPROTO_IGMP",
+                NaslValue::Number(IpNextHeaderProtocols::Igmp.to_primitive_values().0.into()),
+            ),
+            ("IPPROTO_IP", NaslValue::Number(IPPROTO_IP.into())),
+            ("TH_FIN", NaslValue::Number(TcpFlags::FIN.into())),
+            ("TH_SYN", NaslValue::Number(TcpFlags::SYN.into())),
+            ("TH_RST", NaslValue::Number(TcpFlags::RST.into())),
+            ("TH_PUSH", NaslValue::Number(TcpFlags::PSH.into())),
+            ("TH_ACK", NaslValue::Number(TcpFlags::ACK.into())),
+            ("TH_URG", NaslValue::Number(TcpFlags::URG.into())),
+            ("IP_RF", NaslValue::Number(IP_RF)),
+            ("IP_DF", NaslValue::Number(IP_DF)),
+            ("IP_MF", NaslValue::Number(IP_MF)),
+            ("IP_OFFMASK", NaslValue::Number(IP_OFFMASK)),
+            (
+                "TCPOPT_MAXSEG",
+                NaslValue::Number(TcpOptionNumbers::MSS.to_primitive_values().0 as i64),
+            ),
+            (
+                "TCPOPT_WINDOW",
+                NaslValue::Number(TcpOptionNumbers::WSCALE.to_primitive_values().0 as i64),
+            ),
+            (
+                "TCPOPT_SACK_PERMITTED",
+                NaslValue::Number(TcpOptionNumbers::SACK_PERMITTED.to_primitive_values().0 as i64),
+            ),
+            (
+                "TCPOPT_TIMESTAMP",
+                NaslValue::Number(TcpOptionNumbers::TIMESTAMPS.to_primitive_values().0 as i64),
+            ),
+        ]
+    }
 }

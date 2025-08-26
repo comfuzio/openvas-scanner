@@ -106,8 +106,8 @@ pub enum NameSpaceSelector {
 }
 
 pub const CACHE_KEY: &str = "nvticache";
-pub const NOTUS_KEY: &str = "notuscache";
-pub const DB_INDEX: &str = "GVM.__GlobalDBIndex";
+const NOTUS_KEY: &str = "notuscache";
+const DB_INDEX: &str = "GVM.__GlobalDBIndex";
 
 impl NameSpaceSelector {
     fn max_db(kb: &mut redis::Connection) -> RedisStorageResult<u32> {
@@ -313,7 +313,7 @@ pub trait RedisGetNvt: RedisWrapper {
 
     #[inline(always)]
     fn get_prefs(&mut self, oid: &str) -> RedisStorageResult<Vec<NvtPreference>> {
-        let keyname = format!("oid:{}:prefs", oid);
+        let keyname = format!("oid:{oid}:prefs");
         let mut prefs_list = self.lrange(&keyname, 0, -1)?;
         let mut prefs: Vec<NvtPreference> = Vec::new();
         for p in prefs_list.iter_mut() {
@@ -355,7 +355,7 @@ pub trait RedisGetNvt: RedisWrapper {
     }
 
     fn redis_get_advisory(&mut self, oid: &str) -> RedisStorageResult<Option<Nvt>> {
-        let keyname = format!("internal/notus/advisories/{}", oid);
+        let keyname = format!("internal/notus/advisories/{oid}");
         let nvt_data = self.lindex(&keyname, 0)?;
         if nvt_data.is_empty() {
             return Ok(None);
@@ -372,7 +372,7 @@ pub trait RedisGetNvt: RedisWrapper {
     /// - 'oid:<OID>:prefs': stores the plugins preferences, including the script_timeout
     ///   (which is especial and uses preferences id 0)
     fn redis_get_vt(&mut self, oid: &str) -> RedisStorageResult<Option<Nvt>> {
-        let keyname = format!("nvt:{}", oid);
+        let keyname = format!("nvt:{oid}");
         let nvt_data = self.lrange(&keyname, 0, -1)?;
 
         if nvt_data.is_empty() {
@@ -618,20 +618,5 @@ impl RedisCtx {
             .arg("FLUSHDB")
             .query::<()>(&mut self.kb.as_mut().expect("Valid redis connection"))?;
         Ok(())
-    }
-
-    //Wrapper function to avoid accessing kb member directly.
-    pub fn set_value<T: ToRedisArgs>(&mut self, key: &str, val: T) -> RedisStorageResult<()> {
-        () = self
-            .kb
-            .as_mut()
-            .expect("Valid redis connection")
-            .set(key, val)?;
-        Ok(())
-    }
-
-    pub fn value(&mut self, key: &str) -> RedisStorageResult<String> {
-        let ret: RedisValueHandler = self.kb.as_mut().expect("Valid redis connection").get(key)?;
-        Ok(ret.v)
     }
 }

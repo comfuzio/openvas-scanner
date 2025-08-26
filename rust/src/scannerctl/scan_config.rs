@@ -101,7 +101,7 @@ async fn execute(
     scan.target.ports = ports;
     let out =
         serde_json::to_string_pretty(&scan).map_err(|e| CliErrorKind::Corrupt(format!("{e:?}")))?;
-    println!("{}", out);
+    println!("{out}");
     Ok(())
 }
 
@@ -174,7 +174,7 @@ impl PortList {
 
 /// Error types
 #[derive(Debug, Clone)]
-pub enum Error {
+enum Error {
     /// XML parse error
     ParseError(String),
     /// Storage error
@@ -184,8 +184,8 @@ pub enum Error {
 impl Display for Error {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            Error::ParseError(s) => write!(f, "Parse error: {}", s),
-            Error::StorageError(s) => write!(f, "Storage error: {}", s),
+            Error::ParseError(s) => write!(f, "Parse error: {s}"),
+            Error::StorageError(s) => write!(f, "Storage error: {s}"),
         }
     }
 }
@@ -199,12 +199,12 @@ impl From<StorageError> for Error {
 impl std::error::Error for Error {}
 
 /// Parse a port list from a string.
-pub fn parse_portlist<R>(pl: R) -> Result<Vec<Port>, Error>
+fn parse_portlist<R>(pl: R) -> Result<Vec<Port>, Error>
 where
     R: BufRead,
 {
     let result = quick_xml::de::from_reader::<R, PortList>(pl)
-        .map_err(|e| Error::ParseError(format!("Error parsing port list: {}", e)))?;
+        .map_err(|e| Error::ParseError(format!("Error parsing port list: {e}")))?;
     tracing::trace!(
         "transforming portlist {} {} ({}) with {} entries.",
         &result.id,
@@ -264,16 +264,16 @@ struct ScanConfigPreferenceNvt {
     name: String,
 }
 
-pub trait OspStorage: Retriever<Oid, Item = Nvt> + Retriever<Feed, Item = Vec<Nvt>> {}
+trait OspStorage: Retriever<Oid, Item = Nvt> + Retriever<Feed, Item = Vec<Nvt>> {}
 
 impl OspStorage for InMemoryStorage {}
 
-pub fn parse_vts<R>(sc: R, retriever: &dyn OspStorage, vts: &[VT]) -> Result<Vec<VT>, Error>
+fn parse_vts<R>(sc: R, retriever: &dyn OspStorage, vts: &[VT]) -> Result<Vec<VT>, Error>
 where
     R: BufRead,
 {
     let result = quick_xml::de::from_reader::<R, ScanConfig>(sc)
-        .map_err(|e| Error::ParseError(format!("Error parsing vts: {}", e)))?;
+        .map_err(|e| Error::ParseError(format!("Error parsing vts: {e}")))?;
     tracing::debug!(
         "transforming vts {} {} ({}) with {} entries.",
         &result.id,

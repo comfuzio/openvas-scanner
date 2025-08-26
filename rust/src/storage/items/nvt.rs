@@ -41,12 +41,20 @@ use super::kb::KbItem;
 /// - End
 ///
 /// It is defined as a numeric value instead of string representations due to downwards compatible reasons.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Ord, PartialOrd, Default, Hash)]
-#[cfg_attr(
-    feature = "serde_support",
-    derive(serde::Serialize, serde::Deserialize),
-    serde(rename_all = "snake_case")
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    PartialEq,
+    Eq,
+    Ord,
+    PartialOrd,
+    Default,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
 )]
+#[serde(rename_all = "snake_case")]
 pub enum ACT {
     /// Defines a initializer
     Init,
@@ -99,11 +107,7 @@ impl FromStr for ACT {
 macro_rules! make_str_lookup_enum {
     ($enum_name:ident: $doc:expr => { $($matcher:ident => $key:ident),+ }) => {
         #[doc = $doc]
-        #[derive(Clone, Copy, Debug, PartialEq, Eq, Ord,PartialOrd, Hash)]
-        #[cfg_attr(feature = "serde_support",
-                   derive(serde::Serialize, serde::Deserialize),
-                   serde(rename_all = "snake_case")
-        )]
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Ord,PartialOrd, Hash, serde::Serialize, serde::Deserialize)]
         pub enum $enum_name {
             $(
              #[doc = concat!(stringify!($matcher))]
@@ -199,12 +203,10 @@ make_str_lookup_enum! {
 }
 
 /// Allowed types for preferences
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Ord, PartialOrd, Hash)]
-#[cfg_attr(
-    feature = "serde_support",
-    derive(serde::Serialize, serde::Deserialize),
-    serde(rename_all = "lowercase")
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, Ord, PartialOrd, Hash, serde::Serialize, serde::Deserialize,
 )]
+#[serde(rename_all = "lowercase")]
 pub enum PreferenceType {
     #[doc = "checkbox"]
     CheckBox,
@@ -337,22 +339,14 @@ pub struct Oid(pub String);
 #[derive(Clone)]
 pub struct FileName(pub String);
 
-pub type NvtContextKeyField = (String, NvtKey, NvtField);
-
 #[derive(Clone)]
 pub struct FeedVersion;
 
 pub struct Feed;
 
-pub type FeedFilter = Vec<NvtField>;
-
 /// Preferences that can be set by a user when running a script.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-#[cfg_attr(
-    feature = "serde_support",
-    derive(serde::Serialize, serde::Deserialize),
-    serde(rename_all = "snake_case")
-)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub struct NvtPreference {
     /// Preference ID
     pub id: Option<i32>,
@@ -365,12 +359,8 @@ pub struct NvtPreference {
 }
 
 /// References defines where the information for that vulnerability attack is from.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-#[cfg_attr(
-    feature = "serde_support",
-    derive(serde::Serialize, serde::Deserialize),
-    serde(rename_all = "snake_case")
-)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub struct NvtRef {
     /// Reference type ("cve", "bid", ...)
     pub class: String,
@@ -496,7 +486,9 @@ impl TagValue {
                 .as_timestamp()
                 .ok_or_else(error)
                 .map(Self::from),
-            // is set to be ignored
+            // CvssBase is obsolete and has been replaced by CvssBaseVector.
+            // It remains handled solely for backward compatibility.
+            // We ignore it, as all current feed entries use CvssBaseVector.
             TagKey::CvssBase => Ok(TagValue::Null),
             TagKey::Deprecated => match value.to_string().as_str() {
                 "TRUE" | "true" | "1" => Ok(TagValue::Boolean(true)),
@@ -518,12 +510,8 @@ impl TagValue {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
-#[cfg_attr(
-    feature = "serde_support",
-    derive(serde::Serialize, serde::Deserialize),
-    serde(rename_all = "snake_case")
-)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 /// Structure to hold a NVT
 pub struct Nvt {
     /// The ID of the nvt.
@@ -556,8 +544,6 @@ pub struct Nvt {
     pub family: String,
 }
 
-pub type NvtIdentifier = String;
-
 impl Display for Nvt {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "VT {} ({})", self.oid, self.filename)
@@ -586,29 +572,6 @@ impl Nvt {
             NvtField::Category(s) => self.category = s,
             NvtField::Family(s) => self.family = s,
         };
-    }
-    /// Verifies if a nvt is matching a field
-    pub fn matches_field(&self, field: &NvtField) -> bool {
-        match field {
-            NvtField::Oid(x) => &self.oid == x,
-            NvtField::FileName(x) => &self.filename == x,
-            NvtField::Name(x) => &self.name == x,
-            NvtField::Tag(a, _) => self.tag.contains_key(a),
-            NvtField::Dependencies(x) => &self.dependencies == x,
-            NvtField::RequiredKeys(x) => &self.required_keys == x,
-            NvtField::MandatoryKeys(x) => &self.mandatory_keys == x,
-            NvtField::ExcludedKeys(x) => &self.excluded_keys == x,
-            NvtField::RequiredPorts(x) => &self.required_ports == x,
-            NvtField::RequiredUdpPorts(x) => &self.required_udp_ports == x,
-            NvtField::Preference(x) => self.preferences.contains(x),
-            NvtField::Reference(x) => &self.references == x,
-            NvtField::Category(x) => &self.category == x,
-            NvtField::Family(x) => &self.family == x,
-        }
-    }
-    /// Verifies if a nvt is matching a field
-    pub fn matches_any_field(&self, field: &[NvtField]) -> bool {
-        field.iter().any(|x| self.matches_field(x))
     }
 }
 
@@ -764,6 +727,24 @@ impl From<NvtField> for Nvt {
                 family,
                 ..Default::default()
             },
+        }
+    }
+}
+
+impl std::fmt::Display for ACT {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ACT::Attack => write!(f, "ACT_ATTACK"),
+            ACT::Denial => write!(f, "ACT_DENIAL"),
+            ACT::DestructiveAttack => write!(f, "ACT_DESTRUCTIVE_ATTACK"),
+            ACT::End => write!(f, "ACT_END"),
+            ACT::Flood => write!(f, "ACT_FLOOD"),
+            ACT::GatherInfo => write!(f, "ACT_GATHER_INFO"),
+            ACT::Init => write!(f, "ACT_INIT"),
+            ACT::KillHost => write!(f, "ACT_KILL_HOST"),
+            ACT::MixedAttack => write!(f, "ACT_MIXED_ATTACK"),
+            ACT::Scanner => write!(f, "ACT_SCANNER"),
+            ACT::Settings => write!(f, "ACT_SETTINGS"),
         }
     }
 }

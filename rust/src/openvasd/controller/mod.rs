@@ -3,17 +3,18 @@
 // SPDX-License-Identifier: GPL-2.0-or-later WITH x11vnc-openssl-exception
 
 mod context;
-pub mod entry;
-pub mod feed;
-pub mod results;
+mod entry;
+mod feed;
+mod results;
 
 use std::{
+    fmt::Display,
     net::SocketAddr,
     sync::{Arc, RwLock},
 };
 
 use crate::config;
-pub use context::{Context, ContextBuilder, NoOpScanner};
+pub use context::{Context, ContextBuilder};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use scannerlib::models;
 use tokio::net::TcpListener;
@@ -31,6 +32,21 @@ where
         hasher.update(value);
         let hash = hasher.finalize();
         Self(hash.into())
+    }
+}
+
+impl Display for ClientHash {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}",
+            self.0
+                .iter()
+                .fold(String::with_capacity(self.0.len() * 2), |mut a, x| {
+                    a.push_str(&format!("{x:02x}"));
+                    a
+                })
+        )
     }
 }
 

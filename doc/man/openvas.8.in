@@ -60,6 +60,10 @@ contains these options:
 Contains the location of the plugins folder. This is usually
 @OPENVAS_NVT_DIR@, but you may change this.
 
+.IP include_folders
+Contains the location of the include file folder. This is usually
+@OPENVAS_NVT_DIR@, but you may change this.
+
 .IP max_hosts
 is maximum number of hosts to test at the same time which should be
 given to the client (which can override it). This value must be computed
@@ -75,6 +79,9 @@ so you need to find a balance between these two options. Note that launching too
 
 .IP log_whole_attack
 If this option is set to 'yes', openvas will store the name, pid, date and target of each plugin launched. This is helpful for monitoring and debugging purpose, however this option might make openvas fill your disk rather quickly. 
+
+.IP db_address
+Path to the redis socket where the plugins cache and knowledge bases are stored.
 
 .IP report_scripts
 Stores in a file the script run duration in json format. This option expects a valid path to store a file with scripts stats. Script run durations are collected only if the log_whole_attack setting is set to 'yes'. This is helpful for monitoring and debugging purpose, however this option might make openvas fill your disk rather quickly. 
@@ -103,8 +110,23 @@ This is the default range of ports that the scanner plugins will probe. The synt
 .IP test_alive_hosts_only
 If this option is set to 'yes', openvas will scan the target list for alive hosts in a separate process while only testing those hosts which are identified as alive. This boosts the scan speed of target ranges with a high amount of dead hosts significantly.   
 
+.IP alive_test_ports
+Preference to set the port list for the TCP SYN and TCP ACK alive test methods. This setting overwrites the default port list: "21-23,25,53,80,110-111,135,139,143,443,445,993,995,1723,3306,3389,5900,8080".
+
+.IP test_alive_wait_timeout
+This option is to set how long (in sec) Boreas (alive test) waits for replies after last packet was sent. Default: 3 seconds
+
+.IP icmp_retries
+This is the default amount of icmp packets that will be sent to the host target during an alive test. Defaults to 1.
+
+.IP icmp_grace_period
+Wait time between icmp packets during alive tests. Useful for sensitive targets. It can slow down the alive test.
+
 .IP optimize_test
 By default, optimize_test is enabled which means openvas does trust the remote host banners and is only launching plugins against the services they have been designed to check. For example it will check a web server claiming to be IIS only for IIS related flaws but will skip plugins testing for Apache flaws, and so on. This default behavior is used to optimize the scanning performance and to avoid false positives. If you are not sure that the banners of the remote host have been tampered with, you can disable this option.
+
+.IP optimization_level
+Level of test optimization. It checks if plugins requirement are met. Level=1 checks only that required ports are open, level=2 checks open ports and keys requirements are met, else checks also if excluded keys are present or not. Default: no optimization, check everything.
 
 .IP test_empty_vhost
 If set to yes, the scanner will also test the target by using empty vhost value in addition to the target's associated vhost values.
@@ -169,7 +191,50 @@ Maximum load on the system. Once this load is reached, no further VTs are starte
 .IP min_free_mem
 Minimum available memory (in MB) which should be kept free on the system. Once this limit is reached, no further VTs are started until sufficient memory is available again.
 
+.IP max_mem_kb
+Maximum amount of memory (in MB) allowed to use for a single script.
+If this value is set, the amount of memory put into redis is tracked
+for every Script. If the amount of memory exceeds this limit, the
+script is not able to set more kb items. The tracked the value
+written into redis is only estimated, as it does not check, if a
+value was replaced or appended. The size of the key is also not
+tracked. If this value is not set or <= 0, the maximum amount is
+unlimited (Default).
+
+.IP unscanned_closed
+This defines whether TCP ports that were not scanned should be treated like closed ports.
+Defaults to "yes".
+
+.IP unscanned_closed_udp
+This defines whether UDP ports that were not scanned should be treated as closed ports.
+Defaults to "yes".
+
+.IP table_driven_lsc
+This option will enable table driven local security Checks (LSC). This means
+gathered packages are sent to a specialized scanner. This is far more efficient than doing
+checks via NASL.
+Defaults to true.
+
+.IP mqtt_server_uri
+URI to the MQTT server used for internal communication with Notus (table driven LSC).
+This implementation of Notus is in python and it is deprecated, beeing replaced with a Rust implementation of Notus
+
+.IP mqtt_user
+Username for authenticated MQTT communication
+
+.IP mqtt_pass
+Password for authenticated MQTT communication
 The other options in this file can usually be redefined by the client.
+
+.IP openvasd_server
+Openvasd server URI to Rust implementation of Notus. It has priority over MQTT settings.
+
+.IP x-apikey
+API Key for authenticate against openvasd when Notus Rust implementation is enabled
+
+.IP nasl_no_signature_check
+Enable/disable the Feed signacture check. Pay attention to the negative logic of this setting.
+
 
 .SH NETWORK USAGE
 

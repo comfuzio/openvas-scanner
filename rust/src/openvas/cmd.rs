@@ -8,14 +8,6 @@ use std::{
     process::{Child, Command},
 };
 
-/// This module provides functions to call the openvas executable for different
-/// purposes, e.g. start or stopping a scan.
-///
-/// Check if it is possible to start openvas.
-pub fn check() -> bool {
-    Command::new("openvas").spawn().is_ok()
-}
-
 /// Check if it is possible to start openvas with the sudo command. In most
 /// environments it is necessary to start openvas as sudo, as it is not possible
 /// to use all functionalities.
@@ -39,7 +31,7 @@ pub fn read_openvas_config() -> Result<Ini> {
 pub fn get_redis_socket() -> String {
     if let Ok(config) = read_openvas_config() {
         return match config.get("default", "db_address") {
-            Some(setting) => format!("unix://{}", setting),
+            Some(setting) => format!("unix://{setting}"),
             None => String::new(),
         };
     }
