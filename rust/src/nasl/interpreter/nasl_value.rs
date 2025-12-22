@@ -9,7 +9,6 @@ use regex::Regex;
 
 use crate::nasl::interpreter::error::ExprError;
 use crate::nasl::syntax::grammar::{Block, Statement};
-use crate::nasl::utils::function::bytes_to_str;
 use crate::{
     nasl::interpreter::InterpreterErrorKind as ErrorKind,
     storage::items::{kb::KbItem, nvt::ACT},
@@ -59,13 +58,52 @@ pub enum NaslValue {
     /// display(get_kb_item("test"));
     /// ```
     /// to print each kb_item within test.
-    Fork(Vec<NaslValue>),
+    Fork(Fork),
     /// Signals continuing a loop
     Continue,
     /// Signals a break of a control structure
     Break,
     /// Exit value of the script
     Exit(i64),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+/// Contains all the data to create interpreter forks.
+pub struct Fork {
+    /// The list of values. Each of these will create a fork.
+    pub values: Vec<NaslValue>,
+    /// The kind of the fork. Forking for the same kind twice in a row
+    /// will only fork once (the second forking call will instead return
+    /// the value the interpreter was spawned with).
+    pub kind: Option<ForkKind>,
+}
+
+impl Fork {
+    pub fn new(values: impl Iterator<Item = NaslValue>) -> Self {
+        Self {
+            values: values.collect(),
+            kind: None,
+        }
+    }
+
+    pub fn with_kind(self, kind: ForkKind) -> Self {
+        Self {
+            values: self.values,
+            kind: Some(kind),
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+pub enum ForkKind {
+    Host,
+    Kb,
+}
+
+impl From<Fork> for NaslValue {
+    fn from(fork: Fork) -> Self {
+        NaslValue::Fork(fork)
+    }
 }
 
 impl NaslValue {
@@ -111,7 +149,7 @@ impl NaslValue {
     pub(crate) fn as_string(&self) -> Result<String, ErrorKind> {
         match self {
             NaslValue::String(string) => Ok(string.clone()),
-            NaslValue::Data(buffer) => Ok(bytes_to_str(buffer)),
+            NaslValue::Data(buffer) => Ok(String::from_utf8_lossy(buffer).to_string()),
             _ => Err(ErrorKind::ExpectedString),
         }
     }
@@ -320,7 +358,8 @@ impl Display for NaslValue {
             NaslValue::Fork(x) => write!(
                 f,
                 "Fork[{}]",
-                x.iter()
+                x.values
+                    .iter()
                     .map(|v| v.to_string())
                     .collect::<Vec<String>>()
                     .join(",")

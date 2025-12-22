@@ -1729,7 +1729,13 @@ fn dump_icmp_packet(positional: CheckedPositionals<Ipv4Packet>) -> Result<NaslVa
 // The line just tries to allow another linting rule, so disabling the `unexpected_cfg` lint
 // here should be reasonably safe.
 // https://github.com/libpnet/libpnet/blob/a01aa493e2ecead4c45e7322b6c5f7ab29e8a985/pnet_macros/src/decorator.rs#L1138
-#[allow(unexpected_cfgs)]
+//
+// Allowing this lint on a module basis does not work currently:
+// https://github.com/rust-lang/rust/issues/124735
+// so we have to allow it library wide. See src/lib.rs
+//
+// The following line is useless:
+// #[allow(unexpected_cfgs)]
 mod igmp {
     use std::net::Ipv4Addr;
 
@@ -1824,7 +1830,7 @@ fn forge_igmp_packet(
     let mut igmp_pkt = igmp::MutableIgmpPacket::new(&mut buf).unwrap();
 
     // use register since type is codeword
-    match register.nasl_value("type") {
+    match register.local_nasl_value("type") {
         Ok(NaslValue::Number(x)) => igmp_pkt.set_igmp_type(igmp::IgmpType::new(*x as u8)),
         _ => igmp_pkt.set_igmp_type(igmp::IgmpTypes::Default),
     };
@@ -2451,7 +2457,6 @@ fn dump_ip_v6_packet(positional: CheckedPositionals<Ipv6Packet>) {
 /// - th_win: is the TCP window size. NASL will convert it into network order if necessary. 0 by default.
 /// - th_sum: is the TCP checksum. By default, the right value is computed.
 /// - th_urp: is the urgent pointer. 0 by default.
-/// - update_ip_len: is a flag (TRUE by default). If set, NASL will recompute the size field of the IP datagram.
 ///
 /// The modified IP datagram or NULL on error.
 #[nasl_function(named(
@@ -3317,10 +3322,16 @@ function_set! {
         (nasl_send_capture, "send_capture"),
 
       //IPv6
+
+        (forge_ip_v6_packet, "forge_ipv6_packet"), // this alias is deprecated.
         forge_ip_v6_packet,
+        (get_ip_v6_element, "get_ipv6_element"),
         get_ip_v6_element,
+        (set_ip_v6_elements,"set_ipv6_elements"),
         set_ip_v6_elements,
+        (insert_ip_v6_options, "insert_ipv6_options"),
         insert_ip_v6_options,
+        (dump_ip_v6_packet,"dump_ipv6_packet"),
         dump_ip_v6_packet,
         forge_tcp_v6_packet,
         (get_tcp_element, "get_tcp_v6_element"),

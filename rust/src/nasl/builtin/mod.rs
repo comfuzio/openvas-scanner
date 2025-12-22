@@ -15,7 +15,9 @@ mod http;
 mod isotime;
 mod knowledge_base;
 pub mod misc;
-mod network;
+pub mod network;
+mod snmp;
+
 mod preferences;
 #[cfg(feature = "nasl-builtin-raw-ip")]
 pub mod raw_ip;
@@ -24,6 +26,7 @@ mod report_functions;
 mod ssh;
 mod string;
 mod sys;
+mod wmi;
 
 #[cfg(test)]
 mod tests;
@@ -59,12 +62,15 @@ pub fn nasl_std_functions() -> Executor {
         .add_set(sys::Sys)
         .add_set(ssh::Ssh::default())
         .add_set(find_service::FindService)
+        .add_set(wmi::Wmi)
+        .add_set(snmp::Snmp)
         .add_set(cert::NaslCerts::default());
 
     #[cfg(feature = "nasl-builtin-raw-ip")]
     executor.add_set(raw_ip::RawIp);
     #[cfg(feature = "nasl-builtin-raw-ip")]
     executor.add_global_vars(raw_ip::RawIp);
+    executor.add_global_vars(network::socket::SocketFns);
 
     executor
 }

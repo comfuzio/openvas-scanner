@@ -319,6 +319,7 @@ impl<'a> Iterator for HashSumNameLoader<'a> {
 }
 
 /// Contains all information  necessary to do a hash sum check
+#[derive(Debug)]
 pub struct HashSumFileItem<'a> {
     pub file_name: String,
     pub hashsum: String,
@@ -363,7 +364,10 @@ fn get_all_plugins(loader: &FSPluginLoader) -> Vec<PathBuf> {
             .into_iter()
             .filter_map(|e| e.ok())
         {
-            if e.path().extension().is_some_and(|ext| ext == "nasl") {
+            if e.path()
+                .extension()
+                .is_some_and(|ext| ext == "nasl" || ext == "notus")
+            {
                 let relative_path = e.path().strip_prefix(Path::new(&rp)).unwrap();
                 files.push(relative_path.to_owned());
             }

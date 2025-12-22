@@ -4,7 +4,6 @@
 
 use std::path::PathBuf;
 
-use crate::models::{AliveTestMethods, Parameter, Protocol, ScanID};
 use crate::nasl::interpreter::{ForkingInterpreter, InterpreterError};
 use crate::nasl::utils::lookup_keys::SCRIPT_PARAMS;
 use crate::nasl::utils::scan_ctx::{ContextStorage, Ports, Target};
@@ -13,8 +12,9 @@ use crate::scheduling::Stage;
 use crate::storage::Retriever;
 use crate::storage::error::StorageError;
 use crate::storage::items::kb::{self, KbContext, KbContextKey, KbItem, KbKey};
-use crate::storage::items::nvt::Nvt;
 use futures::StreamExt;
+use greenbone_scanner_framework::models::VTData;
+use greenbone_scanner_framework::models::{AliveTestMethods, Parameter, Protocol};
 use tracing::{error_span, trace, warn};
 
 use crate::nasl::prelude::*;
@@ -34,10 +34,10 @@ pub struct VTRunner<'a, S: ScannerStack> {
 
     target: &'a Target,
     ports: &'a Ports,
-    vt: &'a Nvt,
+    vt: &'a VTData,
     stage: Stage,
     param: Option<&'a Vec<Parameter>>,
-    scan_id: ScanID,
+    scan_id: String,
     scan_preferences: &'a ScanPrefs,
     alive_test_methods: &'a Vec<AliveTestMethods>,
 }
@@ -53,10 +53,10 @@ where
         executor: &'a Executor,
         target: &'a Target,
         ports: &'a Ports,
-        vt: &'a Nvt,
+        vt: &'a VTData,
         stage: Stage,
         param: Option<&'a Vec<Parameter>>,
-        scan_id: ScanID,
+        scan_id: String,
         scan_preferences: &'a ScanPrefs,
         alive_test_methods: &'a Vec<AliveTestMethods>,
     ) -> Result<ScriptResult, ExecuteError> {
@@ -121,7 +121,7 @@ where
         }
     }
 
-    fn check_keys(&self, vt: &Nvt) -> Result<(), ScriptResultKind> {
+    fn check_keys(&self, vt: &VTData) -> Result<(), ScriptResultKind> {
         let key = self.generate_key();
         let check_required_key = |k: &str| {
             self.check_key(

@@ -10,12 +10,11 @@ pub mod inmemory;
 pub mod items;
 pub mod redis;
 
-mod time;
-
 use std::{fmt::Display, sync::Arc};
 
 use error::StorageError;
 
+// TODO: why?
 /// The identifier of a Scan
 ///
 /// Either created when creating a new scan or given via models::Scan#scan_id.

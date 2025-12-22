@@ -62,7 +62,7 @@ Ensure (lsc, process_resp)
 {
   advisories_t *advisories = NULL;
 
-  advisories = process_notus_response (resp_str, strlen (resp_str));
+  advisories = lsc_process_response (resp_str, strlen (resp_str));
   assert_that ((*advisories).count, is_equal_to (2));
 
   assert_that ((*advisories).advisories[0]->count, is_equal_to (2));
@@ -92,6 +92,7 @@ Ensure (lsc, process_resp)
 int
 main (int argc, char **argv)
 {
+  int ret;
   TestSuite *suite;
 
   suite = create_test_suite ();
@@ -99,7 +100,11 @@ main (int argc, char **argv)
   add_test_with_context (suite, lsc, process_resp);
   add_test_with_context (suite, lsc, make_pkg_in_json);
   if (argc > 1)
-    return run_single_test (suite, argv[1], create_text_reporter ());
+    ret = run_single_test (suite, argv[1], create_text_reporter ());
+  else
+    ret = run_test_suite (suite, create_text_reporter ());
 
-  return run_test_suite (suite, create_text_reporter ());
+  destroy_test_suite (suite);
+
+  return ret;
 }

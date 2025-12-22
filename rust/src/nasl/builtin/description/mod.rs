@@ -4,11 +4,11 @@
 
 use std::str::FromStr;
 
+use greenbone_scanner_framework::models::PreferenceType;
+
 use crate::nasl::prelude::*;
 
-use crate::storage::items::nvt::{
-    NvtField, NvtPreference, NvtRef, PreferenceType, TagKey, TagValue,
-};
+use crate::storage::items::nvt::{NvtField, NvtPreference, NvtRef, TagKey, TagValue};
 
 /// Makes a storage function based on a very small DSL.
 ///
@@ -72,13 +72,13 @@ macro_rules! make_storage_function {
             )?
             $(
             $(
-            let value = registrat.nasl_value(stringify!($value))?;
+            let value = registrat.global_nasl_value(stringify!($value))?;
             variables.push(value);
             )+
             )?
             $(
             $(
-            if let Ok(value) = registrat.nasl_value(stringify!($optional_value)) {
+            if let Ok(value) = registrat.global_nasl_value(stringify!($optional_value)) {
                variables.push(value);
             }
             )+

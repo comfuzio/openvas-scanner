@@ -2,7 +2,11 @@
 # Usually it is run within a gvm-libs image.
 #/bin/sh
 set -ex
-apt-get update && apt-get install --no-install-recommends --no-install-suggests -y \
+# TODO: create a better structure on various install list to not have to add runtime
+# dependencies into the Dockfile, which can easily overlooked.
+apt-get update 
+
+apt-get install --no-install-recommends --no-install-suggests -y \
     bison \
     build-essential \
     clang \
@@ -23,6 +27,7 @@ apt-get update && apt-get install --no-install-recommends --no-install-suggests 
     libgcrypt-dev \
     libssh-dev \
     libbsd-dev \
+    libsnmp-dev \
     libgssapi3-heimdal \
     krb5-multidev \
     libasn1-8-heimdal \
@@ -32,9 +37,13 @@ apt-get update && apt-get install --no-install-recommends --no-install-suggests 
     libcurl4 \
     libcurl4-gnutls-dev \
     libhiredis-dev \
-    && rm -rf /var/lib/apt/lists/*
+    libmagic-dev 
 
-curl -L -o cgreen.tar.gz https://github.com/cgreen-devs/cgreen/archive/refs/tags/1.6.3.tar.gz -k
-tar -xzf cgreen.tar.gz && cd cgreen-1.6.3
-make install
+apt-get install --no-install-recommends --no-install-suggests -y \
+    libcgreen1-dev || \
+    echo "no cgreen available, tests won't run"
+
+rm -rf /var/lib/apt/lists/*
+
+
 ldconfig

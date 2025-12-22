@@ -7,17 +7,17 @@ mod wave;
 
 use std::{collections::HashMap, fmt::Display, io::Write, sync::Arc};
 
-use crate::{
-    models::{Parameter, VT},
-    storage::{
-        Retriever,
-        error::StorageError,
-        infisto::json::JsonStorage,
-        inmemory::InMemoryStorage,
-        items::nvt::{ACT, FileName, Nvt, Oid},
-        redis::{RedisAddAdvisory, RedisAddNvt, RedisGetNvt, RedisStorage, RedisWrapper},
-    },
+use crate::storage::{
+    Retriever,
+    error::StorageError,
+    infisto::json::JsonStorage,
+    inmemory::InMemoryStorage,
+    items::nvt::{ACT, FileName, Oid},
+    redis::{RedisAddAdvisory, RedisAddNvt, RedisGetNvt, RedisStorage, RedisWrapper},
 };
+
+use greenbone_scanner_framework::models::VTData;
+use greenbone_scanner_framework::models::{Parameter, VT};
 use thiserror::Error;
 
 pub use wave::WaveExecutionPlan;
@@ -30,7 +30,7 @@ pub enum VTError {
     DB(#[from] StorageError),
     #[error("{0} misses required dependencies {1:?}")]
     /// Will be returned when Scheduler tries to schedule a VT with missing dependencies
-    MissingDependencies(Nvt, Vec<String>),
+    MissingDependencies(VTData, Vec<String>),
     #[error("invalid index ({0}) for Stage")]
     /// The index to create the stage is out of bounds
     InvalidStageIndex(usize),
@@ -65,8 +65,8 @@ impl Display for Stage {
     }
 }
 
-impl From<&Nvt> for Stage {
-    fn from(value: &Nvt) -> Self {
+impl From<&VTData> for Stage {
+    fn from(value: &VTData) -> Self {
         match value.category {
             ACT::Init | ACT::Scanner | ACT::Settings | ACT::GatherInfo => Self::Discovery,
             ACT::Attack | ACT::MixedAttack => Self::NonEvasive,
@@ -101,7 +101,10 @@ impl TryFrom<usize> for Stage {
     }
 }
 
-pub trait SchedulerStorage: Retriever<Oid, Item = Nvt> + Retriever<FileName, Item = Nvt> {}
+pub trait SchedulerStorage:
+    Retriever<Oid, Item = VTData> + Retriever<FileName, Item = VTData>
+{
+}
 
 impl SchedulerStorage for InMemoryStorage {}
 impl<T: Write + Send> SchedulerStorage for JsonStorage<T> {}
@@ -130,8 +133,8 @@ pub trait ExecutionPlaner {
         E: ExecutionPlan;
 }
 
-/// Contains the Nvt and maybe parameter required to be executed
-type RuntimeVT = (Nvt, Option<Vec<Parameter>>);
+/// Contains the VTData and maybe parameter required to be executed
+type RuntimeVT = (VTData, Option<Vec<Parameter>>);
 
 /// Is the result of the Iterator if ExecutionPlaner
 ///
@@ -165,7 +168,7 @@ pub trait ExecutionPlan: Iterator<Item = Result<Vec<RuntimeVT>, VTError>> + Defa
     fn append_vt(
         &mut self,
         vts: RuntimeVT,
-        dependency_lookup: &HashMap<String, Nvt>,
+        dependency_lookup: &HashMap<String, VTData>,
     ) -> Result<(), VTError>;
 }
 
@@ -258,7 +261,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use crate::models::VT;
+    use greenbone_scanner_framework::models::VT;
 
     use crate::scanner::Scan;
     use crate::scheduling::ExecutionPlaner;
@@ -267,24 +270,24 @@ mod tests {
     use crate::storage::Dispatcher;
     use crate::storage::inmemory::InMemoryStorage;
     use crate::storage::items::nvt::FileName;
-    use crate::storage::items::nvt::Nvt;
+    use greenbone_scanner_framework::models::VTData;
 
     #[test]
     #[tracing_test::traced_test]
     fn load_dependencies() {
         let feed = vec![
-            Nvt {
+            VTData {
                 oid: "0".to_string(),
                 filename: "/0".to_string(),
                 ..Default::default()
             },
-            Nvt {
+            VTData {
                 oid: "1".to_string(),
                 filename: "/1".to_string(),
                 dependencies: vec!["/0".to_string()],
                 ..Default::default()
             },
-            Nvt {
+            VTData {
                 oid: "2".to_string(),
                 filename: "/2".to_string(),
                 dependencies: vec!["/1".to_string()],

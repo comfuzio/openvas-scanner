@@ -8,13 +8,16 @@ pub mod error;
 pub mod interpreter;
 pub mod syntax;
 pub mod utils;
+mod version;
 
 #[cfg(test)]
 mod test_utils;
 
 #[cfg(feature = "nasl-builtin-raw-ip")]
 pub mod raw_ip_utils {
+    pub use super::builtin::raw_ip::RawIpError;
     pub use super::builtin::raw_ip::raw_ip_utils;
+    pub use super::builtin::raw_ip::tcp_ping;
 }
 
 pub mod prelude {
@@ -37,6 +40,7 @@ pub mod prelude {
     pub use super::utils::scan_ctx::ScanCtx;
     pub use super::utils::scan_ctx::ScanCtxBuilder;
     pub use super::utils::scan_ctx::ScriptCtx;
+    pub use super::version::NaslVersion;
     pub use crate::function_set;
     pub use nasl_function_proc_macro::nasl_function;
 }

@@ -2,6 +2,9 @@
 //
 // SPDX-License-Identifier: GPL-2.0-or-later WITH x11vnc-openssl-exception
 
+use greenbone_scanner_framework::models::VtDataError;
+use std::str::Utf8Error;
+
 use thiserror::Error;
 
 use crate::nasl::builtin::BuiltinError;
@@ -41,6 +44,12 @@ impl FnError {
     }
 }
 
+impl From<VtDataError> for FnError {
+    fn from(value: VtDataError) -> Self {
+        Self::from(ArgumentError::WrongArgument(value.to_string()))
+    }
+}
+
 impl From<FnErrorKind> for FnError {
     fn from(kind: FnErrorKind) -> Self {
         FnError::from_kind(kind)
@@ -71,6 +80,16 @@ impl From<InternalError> for FnError {
             retryable,
             return_behavior: ReturnBehavior::ExitScript,
         }
+    }
+}
+
+impl From<Utf8Error> for FnError {
+    fn from(value: Utf8Error) -> Self {
+        FnErrorKind::Argument(ArgumentError::WrongArgument(format!(
+            "Invalid UTF-8 sequence: {}",
+            value
+        )))
+        .into()
     }
 }
 

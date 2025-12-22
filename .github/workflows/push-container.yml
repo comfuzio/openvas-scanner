@@ -26,6 +26,10 @@ on:
         required: true
       greenbone_registry_token:
         required: true
+      greenbone_registry_read_user:
+        required: true
+      greenbone_registry_read_token:
+        required: true
       greenbone_registry_replication_user:
         required: false
       greenbone_registry_replication_token:
@@ -47,7 +51,10 @@ jobs:
     runs-on: self-hosted-generic-arm64
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
+      - uses: ./.github/actions/copy-docker-binaries
+        with:
+          arch: arm64 
       - name: Container build and push 3rd gen
         id: build-and-push
         uses: greenbone/actions/container-build-push-generic@v3
@@ -85,7 +92,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
+      - uses: ./.github/actions/copy-docker-binaries
+        with:
+          arch: amd64 
       - name: Container build and push 3rd gen
         id: build-and-push
         uses: greenbone/actions/container-build-push-generic@v3
@@ -119,6 +129,7 @@ jobs:
           scout-user: ${{ secrets.dockerhub_user }}
           scout-password: ${{ secrets.dockerhub_token }}
 
+  #not able to speed that up via prebuild binaries
   greenbone_reg_debian_stable:
     name: greenbone-reg:debian:stable
     uses: greenbone/workflows/.github/workflows/container-build-push-2nd-gen.yml@main
@@ -137,6 +148,8 @@ jobs:
       GREENBONE_REGISTRY: ${{ secrets.greenbone_registry }}
       GREENBONE_REGISTRY_USER: ${{ secrets.greenbone_registry_user }}
       GREENBONE_REGISTRY_TOKEN: ${{ secrets.greenbone_registry_token }}
+      GREENBONE_REGISTRY_READ_USER: ${{ secrets.greenbone_registry_read_user }}
+      GREENBONE_REGISTRY_READ_TOKEN: ${{ secrets.greenbone_registry_read_token }}
       GREENBONE_REGISTRY_REPLICATION_USER: ${{ secrets.greenbone_registry_replication_user }}
       GREENBONE_REGISTRY_REPLICATION_TOKEN: ${{ secrets.greenbone_registry_replication_token }}
       MATTERMOST_WEBHOOK_URL: ${{ secrets.mattermost_webhook_url }}

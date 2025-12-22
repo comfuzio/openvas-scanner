@@ -12,17 +12,17 @@ use super::dberror::RedisStorageResult;
 use itertools::Itertools;
 use redis::*;
 
-use crate::models;
-use crate::models::Vulnerability;
-
+use crate::notus::advisories::Vulnerability;
+use crate::notus::advisories::VulnerabilityData;
 use crate::storage::StorageError;
+use crate::storage::items::nvt;
 use crate::storage::items::nvt::ACT;
-use crate::storage::items::nvt::Nvt;
 use crate::storage::items::nvt::NvtKey;
 use crate::storage::items::nvt::NvtPreference;
 use crate::storage::items::nvt::NvtRef;
 use crate::storage::items::nvt::TagKey;
 use crate::storage::items::nvt::TagValue;
+use greenbone_scanner_framework::models::VTData;
 
 enum KbNvtPos {
     Filename,
@@ -106,7 +106,7 @@ pub enum NameSpaceSelector {
 }
 
 pub const CACHE_KEY: &str = "nvticache";
-const NOTUS_KEY: &str = "notuscache";
+pub const NOTUS_KEY: &str = "notuscache";
 const DB_INDEX: &str = "GVM.__GlobalDBIndex";
 
 impl NameSpaceSelector {
@@ -138,7 +138,7 @@ impl NameSpaceSelector {
             NameSpaceSelector::Free => {
                 Self::select_namespace(kb, 0)?;
                 for dbi in 1..max_db {
-                    match kb.hset_nx(DB_INDEX, dbi, 1) {
+                    match redis::Commands::hset_nx(kb, DB_INDEX, dbi, 1) {
                         Ok(1) => {
                             Self::select_namespace(kb, dbi)?;
                             return Ok(dbi);
@@ -152,7 +152,7 @@ impl NameSpaceSelector {
             NameSpaceSelector::Key(key) => {
                 for dbi in 1..max_db {
                     Self::select_namespace(kb, dbi)?;
-                    match kb.exists(key) {
+                    match redis::Commands::exists(kb, key) {
                         Ok(1) => return Ok(dbi),
                         Ok(_) => {}
                         Err(err) => return Err(err.into()),
@@ -184,63 +184,55 @@ impl RedisWrapper for RedisCtx {
     ///Wrapper function to avoid accessing kb member directly.
     #[inline(always)]
     fn rpush<T: ToRedisArgs>(&mut self, key: &str, val: T) -> RedisStorageResult<()> {
-        self.kb
-            .as_mut()
-            .expect("Valid redis connection")
-            .rpush(key, val)
-            .map_err(|e| e.into())
+        redis::Commands::rpush(self.kb.as_mut().expect("Valid redis connection"), key, val)
+            .map_err(DbError::from)
     }
 
     ///Wrapper function to avoid accessing kb member directly.
     #[inline(always)]
     fn lpush<T: ToRedisArgs>(&mut self, key: &str, val: T) -> RedisStorageResult<()> {
-        self.kb
-            .as_mut()
-            .expect("Valid redis connection")
-            .lpush(key, val)
-            .map_err(|e| e.into())
+        redis::Commands::lpush(self.kb.as_mut().expect("Valid redis connection"), key, val)
+            .map_err(DbError::from)
     }
 
     ///Wrapper function to avoid accessing kb member directly.
     #[inline(always)]
     fn del(&mut self, key: &str) -> RedisStorageResult<()> {
-        self.kb
-            .as_mut()
-            .expect("Valid redis connection")
-            .del(key)
-            .map_err(|e| e.into())
+        redis::Commands::del(self.kb.as_mut().expect("Valid redis connection"), key)
+            .map_err(DbError::from)
     }
 
     ///Wrapper function to avoid accessing kb member directly.
     #[inline(always)]
     fn lindex(&mut self, key: &str, index: isize) -> RedisStorageResult<String> {
-        let ret: RedisValueHandler = self
-            .kb
-            .as_mut()
-            .expect("Valid redis connection")
-            .lindex(key, index)?;
+        let ret: RedisValueHandler = redis::Commands::lindex(
+            self.kb.as_mut().expect("Valid redis connection"),
+            key,
+            index,
+        )
+        .map_err(DbError::from)?;
         Ok(ret.v)
     }
 
     ///Wrapper function to avoid accessing kb member directly.
     #[inline(always)]
     fn lrange(&mut self, key: &str, start: isize, end: isize) -> RedisStorageResult<Vec<String>> {
-        let ret = self
-            .kb
-            .as_mut()
-            .expect("Valid redis connection")
-            .lrange(key, start, end)?;
+        let ret = redis::Commands::lrange(
+            self.kb.as_mut().expect("Valid redis connection"),
+            key,
+            start,
+            end,
+        )
+        .map_err(DbError::from)?;
         Ok(ret)
     }
 
     ///Wrapper function to avoid accessing kb member directly.
     #[inline(always)]
     fn keys(&mut self, pattern: &str) -> RedisStorageResult<Vec<String>> {
-        let ret: Vec<String> = self
-            .kb
-            .as_mut()
-            .expect("Valid redis connection")
-            .keys(pattern)?;
+        let ret: Vec<String> =
+            redis::Commands::keys(self.kb.as_mut().expect("Valid redis connection"), pattern)
+                .map_err(DbError::from)?;
         Ok(ret)
     }
 
@@ -271,10 +263,10 @@ pub trait RedisAddAdvisory: RedisWrapper {
     /// - 'nvt:<OID>': stores the general metadata ordered following the KbNvtPos indexes
     /// - 'oid:<OID>:prefs': stores the plugins preferences, including the script_timeout
     ///   (which is especial and uses preferences id 0)
-    fn redis_add_advisory(
-        &mut self,
-        adv: Option<models::VulnerabilityData>,
-    ) -> RedisStorageResult<()> {
+    ///
+    /// To call with None is only required when using ospd-openvas and updating the feed into
+    /// redis.
+    fn redis_add_advisory(&mut self, adv: Option<VulnerabilityData>) -> RedisStorageResult<()> {
         match adv {
             Some(data) => {
                 let key = format!("internal/notus/advisories/{}", &data.adv.oid);
@@ -354,7 +346,7 @@ pub trait RedisGetNvt: RedisWrapper {
         tag_map
     }
 
-    fn redis_get_advisory(&mut self, oid: &str) -> RedisStorageResult<Option<Nvt>> {
+    fn redis_get_advisory(&mut self, oid: &str) -> RedisStorageResult<Option<VTData>> {
         let keyname = format!("internal/notus/advisories/{oid}");
         let nvt_data = self.lindex(&keyname, 0)?;
         if nvt_data.is_empty() {
@@ -362,7 +354,7 @@ pub trait RedisGetNvt: RedisWrapper {
         }
 
         if let Ok(adv) = serde_json::from_str::<Vulnerability>(&nvt_data) {
-            Ok(Some(Nvt::from((oid, adv))))
+            Ok(Some(nvt::Nvt::from((oid, adv)).data))
         } else {
             Ok(None)
         }
@@ -371,7 +363,7 @@ pub trait RedisGetNvt: RedisWrapper {
     /// - 'nvt:<OID>': stores the general metadata ordered following the KbNvtPos indexes
     /// - 'oid:<OID>:prefs': stores the plugins preferences, including the script_timeout
     ///   (which is especial and uses preferences id 0)
-    fn redis_get_vt(&mut self, oid: &str) -> RedisStorageResult<Option<Nvt>> {
+    fn redis_get_vt(&mut self, oid: &str) -> RedisStorageResult<Option<VTData>> {
         let keyname = format!("nvt:{oid}");
         let nvt_data = self.lrange(&keyname, 0, -1)?;
 
@@ -379,7 +371,7 @@ pub trait RedisGetNvt: RedisWrapper {
             return Ok(None);
         }
 
-        let nvt = Nvt {
+        let nvt = VTData {
             oid: oid.to_string(),
             name: nvt_data[KbNvtPos::Name as usize].clone(),
             filename: nvt_data[KbNvtPos::Filename as usize].clone(),
@@ -501,7 +493,7 @@ pub trait RedisAddNvt: RedisWrapper {
     /// - 'nvt:<OID>': stores the general metadata ordered following the KbNvtPos indexes
     /// - 'oid:<OID>:prefs': stores the plugins preferences, including the script_timeout
     ///   (which is especial and uses preferences id 0)
-    fn redis_add_nvt(&mut self, nvt: Nvt) -> RedisStorageResult<()> {
+    fn redis_add_nvt(&mut self, nvt: VTData) -> RedisStorageResult<()> {
         let oid = nvt.oid;
         let name = nvt.name;
         let required_keys = nvt.required_keys.join(", ");
@@ -609,14 +601,6 @@ impl RedisCtx {
             .arg("FLUSHDB")
             .query::<()>(&mut self.kb.as_mut().expect("Valid redis connection"))?;
         self.release_namespace()?;
-        Ok(())
-    }
-
-    /// Clean up the namespace.
-    pub fn flush_namespace(&mut self) -> RedisStorageResult<()> {
-        Cmd::new()
-            .arg("FLUSHDB")
-            .query::<()>(&mut self.kb.as_mut().expect("Valid redis connection"))?;
         Ok(())
     }
 }

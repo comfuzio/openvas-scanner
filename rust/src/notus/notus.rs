@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 
-use crate::models::{NotusResults, VulnerablePackage};
+use greenbone_scanner_framework::models::{NotusResults, VulnerablePackage};
 
 use crate::feed::VerifyError;
 
@@ -79,8 +79,10 @@ where
 
     fn compare<P: Package>(packages: &Vec<P>, vts: &VulnerabilityTests<P>) -> NotusResults {
         let mut results: NotusResults = HashMap::new();
+        tracing::trace!(vts_keys = ?vts.keys().collect::<Vec<_>>(), packages=?packages.iter().map(|x|x.get_name()).collect::<Vec<_>>());
         for package in packages {
-            match vts.get(&package.get_name()) {
+            let pname = package.get_name();
+            match vts.get(&pname) {
                 Some(vts) => {
                     for vt in vts {
                         if vt.is_vulnerable(package) {
@@ -113,13 +115,18 @@ where
         vts: &VulnerabilityTests<P>,
     ) -> Result<NotusResults, Error> {
         let packages = Self::parse(packages)?;
+        tracing::debug!(
+            packages = packages.len(),
+            vts = vts.len(),
+            "vulnerability loaded."
+        );
         Ok(Self::compare(&packages, vts))
     }
 
     fn signature_check(&self) -> Result<(), Error> {
         if self.signature_check {
             match self.loader.verify_signature() {
-                Ok(_) => tracing::debug!("Signature check succsessful"),
+                Ok(_) => tracing::trace!("Signature check successful"),
                 Err(VerifyError::MissingKeyring) => {
                     tracing::warn!("Signature check enabled but missing keyring");
                     return Err(Error::SignatureCheckError(VerifyError::MissingKeyring));
@@ -161,6 +168,7 @@ where
                 &self.loaded_products[&os.to_string()].0
             }
         };
+        tracing::debug!(os, packages = packages.len(), "products known.");
 
         // Parse and compare package list depending on package type of loaded product
         let results = match product {

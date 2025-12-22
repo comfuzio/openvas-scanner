@@ -4,27 +4,31 @@
 
 //! Defines the context used within the interpreter and utilized by the builtin functions
 
+use greenbone_scanner_framework::models::{
+    AliveTestMethods, Port, PortRange, Protocol, ScanPreference,
+};
+use rand::seq::IndexedRandom;
 use tokio::sync::RwLock;
 
-use crate::models::{AliveTestMethods, Port, PortRange, Protocol, ScanPreference};
 use crate::nasl::builtin::{KBError, NaslSockets};
 use crate::nasl::syntax::Loader;
 use crate::nasl::{FromNaslValue, WithErrorInfo};
-use crate::scanner::preferences::preference::ScanPrefs;
+use crate::scanner::preferences::preference::{ScanPrefs, pref_is_true};
 use crate::storage::error::StorageError;
 use crate::storage::infisto::json::JsonStorage;
 use crate::storage::inmemory::InMemoryStorage;
 use crate::storage::items::kb::{self, KbKey};
 use crate::storage::items::kb::{GetKbContextKey, KbContextKey, KbItem};
-use crate::storage::items::nvt::{Feed, FeedVersion, FileName, Nvt};
+use crate::storage::items::nvt::{Feed, FeedVersion, FileName};
 use crate::storage::items::nvt::{NvtField, Oid};
-use crate::storage::items::result::{ResultContextKeyAll, ResultContextKeySingle, ResultItem};
+use crate::storage::items::result::{ResultContextKeySingle, ResultItem};
 use crate::storage::redis::{
     RedisAddAdvisory, RedisAddNvt, RedisGetNvt, RedisStorage, RedisWrapper,
 };
 use crate::storage::{self, ScanID};
 use crate::storage::{Dispatcher, Remover, Retriever};
-use rand::seq::SliceRandom;
+//TODO: rename
+use greenbone_scanner_framework::models::VTData;
 use std::collections::BTreeSet;
 use std::sync::MutexGuard;
 
@@ -236,15 +240,14 @@ pub trait ContextStorage:
     // results
     + Dispatcher<ScanID, Item = ResultItem>
     + Retriever<ResultContextKeySingle, Item = ResultItem>
-    + Retriever<ResultContextKeyAll, Item = Vec<ResultItem>>
-    + Remover<ResultContextKeySingle, Item = ResultItem>
-    + Remover<ResultContextKeyAll, Item = Vec<ResultItem>>
+    + Retriever<ScanID, Item = Vec<ResultItem>>
+    + Remover<ScanID, Item = Vec<ResultItem>>
     // nvt
-    + Dispatcher<FileName, Item = Nvt>
+    + Dispatcher<FileName, Item = VTData>
     + Dispatcher<FeedVersion, Item = String>
     + Retriever<FeedVersion, Item = String>
-    + Retriever<Feed, Item = Vec<Nvt>>
-    + Retriever<Oid, Item = Nvt> + Retriever<FileName, Item = Nvt>
+    + Retriever<Feed, Item = Vec<VTData>>
+    + Retriever<Oid, Item = VTData> + Retriever<FileName, Item = VTData>
 {
     /// By default the KbKey can hold multiple values. When dispatch is used on an already existing
     /// KbKey, the value is appended to the existing list. This function is used to replace the
@@ -278,7 +281,7 @@ pub struct ScanCtx<'a> {
     /// Function executor.
     executor: &'a Executor,
     /// NVT object, which is put into the storage, when set
-    nvt: Mutex<Option<Nvt>>,
+    nvt: Mutex<Option<VTData>>,
     sockets: RwLock<NaslSockets>,
     /// Scanner preferences
     pub scan_preferences: ScanPrefs,
@@ -363,7 +366,7 @@ impl<'a> ScanCtx<'a> {
         self.target.add_hostname(hostname, source);
     }
 
-    pub fn port_range(&self) -> PortRange {
+    fn port_range(&self) -> PortRange {
         // TODO Get this from the scan prefs
         PortRange {
             start: 0,
@@ -384,31 +387,31 @@ impl<'a> ScanCtx<'a> {
         let mut nvt = self.nvt.lock().unwrap();
         match nvt.as_mut() {
             Some(nvt) => {
-                nvt.set_from_field(field);
+                field.move_to_data(nvt);
             }
             _ => {
-                let mut new = Nvt {
+                let mut new = VTData {
                     filename: self.filename().to_string_lossy().to_string(),
                     ..Default::default()
                 };
-                new.set_from_field(field);
+                field.move_to_data(&mut new);
                 *nvt = Some(new);
             }
         }
     }
 
-    fn dispatch_nvt(&self, nvt: Nvt) {
+    fn dispatch_nvt(&self, nvt: VTData) {
         self.storage
             .dispatch(FileName(self.filename.to_string_lossy().to_string()), nvt)
             .unwrap();
     }
 
-    pub fn set_nvt(&self, vt: Nvt) {
+    pub fn set_nvt(&self, vt: VTData) {
         let mut nvt = self.nvt.lock().unwrap();
         *nvt = Some(vt);
     }
 
-    pub fn nvt(&self) -> MutexGuard<'_, Option<Nvt>> {
+    pub fn nvt(&self) -> MutexGuard<'_, Option<VTData>> {
         self.nvt.lock().unwrap()
     }
 
@@ -556,7 +559,7 @@ impl<'a> ScanCtx<'a> {
             .collect();
 
         let ret = if !ports.is_empty() {
-            *ports.choose(&mut rand::thread_rng()).unwrap()
+            *ports.choose(&mut rand::rng()).unwrap()
         } else if open21 {
             21
         } else if open80 {
@@ -568,10 +571,8 @@ impl<'a> ScanCtx<'a> {
     }
 
     fn get_preference_bool(&self, key: &str) -> Option<bool> {
-        self.scan_preferences
-            .iter()
-            .find(|x| x.id == key)
-            .map(|x| matches!(x.value.as_str(), "true" | "1" | "yes"))
+        let prefs = &self.scan_preferences;
+        pref_is_true(prefs, key)
     }
 
     pub fn get_port_state(&self, port: u16, protocol: Protocol) -> Result<bool, FnError> {
@@ -634,6 +635,7 @@ pub struct ScriptCtx {
     pub alive: bool,
     pub denial_port: Option<u16>,
     pub multicast_groups: Vec<JmpDesc>,
+    pub snmp_next: Option<String>,
 }
 
 pub struct ScanCtxBuilder<'a, P: AsRef<Path>> {

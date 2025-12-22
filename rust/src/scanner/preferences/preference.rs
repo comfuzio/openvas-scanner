@@ -2,10 +2,11 @@
 //
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-use crate::models::{PreferenceValue, Scan, ScanPreference, ScanPreferenceInformation};
+use greenbone_scanner_framework::models::{
+    PreferenceValue, ScanPreference, ScanPreferenceInformation,
+};
 use lazy_static::lazy_static;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 
 pub const PREFERENCES: [ScanPreferenceInformation; 23] = [
     ScanPreferenceInformation {
@@ -233,6 +234,13 @@ lazy_static! {
     pub static ref PREFERENCES_JSON: String = serde_json::to_string(&PREFERENCES).unwrap();
 }
 
+pub fn pref_is_true(prefs: &ScanPrefs, key: &str) -> Option<bool> {
+    prefs
+        .iter()
+        .find(|x| x.id == key)
+        .map(|x| matches!(x.value.as_str(), "true" | "1" | "yes"))
+}
+
 #[derive(Deserialize, Serialize, Debug, Clone, Eq, PartialEq)]
 #[serde(untagged)]
 pub enum ScanPrefValue {
@@ -258,9 +266,7 @@ impl Default for ScanPrefValue {
 }
 
 #[derive(Default, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct FullScanPreferences {
-    scan_preferences: Vec<FullScanPreference>,
-}
+pub struct FullScanPreferences(Vec<FullScanPreference>);
 
 /// Configuration preference information for a scan. The type can be derived from the default value.
 #[derive(Default, Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -300,45 +306,6 @@ impl From<&FullScanPreference> for ScanPreference {
                 ScanPrefValue::Int(v) => v.to_string(),
             },
         }
-    }
-}
-
-impl FullScanPreferences {
-    pub fn new() -> Self {
-        let mut scan_preferences = Vec::new();
-        for pref in PREFERENCES.iter() {
-            scan_preferences.push(FullScanPreference::from(pref));
-        }
-        Self { scan_preferences }
-    }
-
-    /// Override the default scanner preferences with the ones from the config file or command line.
-    pub fn override_default_preferences(&mut self, preferences: HashMap<String, ScanPrefValue>) {
-        for (pref_id, pref_val) in preferences.into_iter() {
-            if let Some(pref) = self.scan_preferences.iter_mut().find(|p| p.id == *pref_id) {
-                pref.default = pref_val.clone();
-            }
-        }
-    }
-
-    pub fn set_scan_with_preferences(&self, scan: &mut Scan) {
-        let mut config_prefs_copy = self.scan_preferences.clone();
-        let scan_prefs = scan.scan_preferences.clone();
-        let mut pref_index_to_remove = vec![];
-        for (i, cp) in self.scan_preferences.iter().enumerate() {
-            for sp in scan_prefs.iter() {
-                if cp.id == sp.id {
-                    pref_index_to_remove.push(i);
-                }
-            }
-        }
-        for i in pref_index_to_remove.iter().rev() {
-            config_prefs_copy.remove(*i);
-        }
-
-        let conf_prefs: Vec<ScanPreference> =
-            config_prefs_copy.iter().map(ScanPreference::from).collect();
-        scan.scan_preferences.0.extend(conf_prefs);
     }
 }
 
@@ -384,6 +351,10 @@ impl ScanPrefs {
 
     pub fn get_preference_string(&self, key: &str) -> Option<String> {
         self.0.iter().find(|x| x.id == key).map(|x| x.value.clone())
+    }
+
+    pub fn get_preference_bool(&self, key: &str) -> Option<bool> {
+        pref_is_true(self, key)
     }
 
     pub fn iter(&self) -> impl Iterator<Item = &ScanPreference> {

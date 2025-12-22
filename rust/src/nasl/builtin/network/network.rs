@@ -13,6 +13,7 @@ use super::{NaslValue, Port, mtu};
 use crate::function_set;
 use crate::nasl::utils::{FnError, ScanCtx};
 use crate::storage::items::kb::{self, KbItem, KbKey};
+use greenbone_scanner_framework::models::Protocol;
 use nasl_function_proc_macro::nasl_function;
 
 /// Get the IP address of the currently scanned host
@@ -132,8 +133,11 @@ fn islocalnet(context: &ScanCtx) -> Result<bool, SocketError> {
 }
 
 /// Declares an open port on the target host
-#[nasl_function(named(port, proto))]
-fn scanner_add_port(context: &ScanCtx, port: Port, proto: Option<&str>) -> Result<(), FnError> {
+pub fn scanner_add_port_shared(
+    context: &ScanCtx,
+    port: Port,
+    proto: Option<&str>,
+) -> Result<(), FnError> {
     let kb_key = match proto {
         Some("udp") => KbKey::Port(kb::Port::Udp(port.0.to_string())),
         _ => KbKey::Port(kb::Port::Tcp(port.0.to_string())),
@@ -142,6 +146,12 @@ fn scanner_add_port(context: &ScanCtx, port: Port, proto: Option<&str>) -> Resul
     context.set_single_kb_item(kb_key, KbItem::Number(1))?;
 
     Ok(())
+}
+
+/// Declares an open port on the target host
+#[nasl_function(named(port, proto))]
+fn scanner_add_port(context: &ScanCtx, port: Port, proto: Option<&str>) -> Result<(), FnError> {
+    scanner_add_port_shared(context, port, proto)
 }
 
 #[nasl_function]
@@ -186,12 +196,12 @@ fn get_port_transport(context: &ScanCtx, port: u16, asstring: bool) -> Result<Na
 
 #[nasl_function]
 fn get_port_state(context: &ScanCtx, port: u16) -> Result<bool, FnError> {
-    context.get_port_state(port, crate::models::Protocol::TCP)
+    context.get_port_state(port, Protocol::TCP)
 }
 
 #[nasl_function]
 fn get_udp_port_state(context: &ScanCtx, port: u16) -> Result<bool, FnError> {
-    context.get_port_state(port, crate::models::Protocol::UDP)
+    context.get_port_state(port, Protocol::UDP)
 }
 
 pub struct Network;

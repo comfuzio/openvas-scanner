@@ -6,11 +6,11 @@ use std::io::BufRead;
 use std::path::Path;
 use std::{io::BufReader, path::PathBuf, sync::Arc};
 
+use greenbone_scanner_framework::models::VTData;
 use scannerlib::models::{self, Parameter, Scan, VT};
-use scannerlib::scanner::preferences::preference::ScanPrefs;
 use scannerlib::storage::Retriever;
 use scannerlib::storage::inmemory::InMemoryStorage;
-use scannerlib::storage::items::nvt::{Feed, Nvt};
+use scannerlib::storage::items::nvt::Feed;
 use start_scan::{StartScan, VtSelection};
 
 use crate::{CliError, CliErrorKind};
@@ -36,7 +36,7 @@ async fn may_transform_start_scan<R, S>(
 ) -> Result<String, CliErrorKind>
 where
     R: BufRead,
-    S: Retriever<Feed, Item = Vec<Nvt>>,
+    S: Retriever<Feed, Item = Vec<VTData>>,
 {
     let xml = quick_xml::de::from_reader(reader)?;
     if print_back {
@@ -48,7 +48,7 @@ where
 
 async fn transform_vts<S>(feed: S, vts: VtSelection) -> Result<Vec<models::VT>, CliErrorKind>
 where
-    S: Retriever<Feed, Item = Vec<Nvt>>,
+    S: Retriever<Feed, Item = Vec<VTData>>,
 {
     let mut result: Vec<_> = vts
         .vt_single
@@ -102,13 +102,13 @@ where
 
 async fn transform_start_scan<S>(feed: S, sc: StartScan) -> Result<String, CliErrorKind>
 where
-    S: Retriever<Feed, Item = Vec<Nvt>>,
+    S: Retriever<Feed, Item = Vec<VTData>>,
 {
     // currently we ignore the previous order as the scanner will reorder
     // when scheduling internally anyway.
     let scan = Scan {
         scan_id: sc.id.unwrap_or_default(),
-        scan_preferences: ScanPrefs(sc.scanner_params.values),
+        scan_preferences: sc.scanner_params.values,
         target: sc.targets.target.into(),
         vts: transform_vts(feed, sc.vt_selection).await?,
     };
@@ -196,7 +196,7 @@ mod tests {
         let d = InMemoryStorage::new();
         let dispatch = |k: &str, f: &str| {
             let key = FileName(format!("{k}.nasl"));
-            let nvt = Nvt {
+            let nvt = VTData {
                 oid: k.into(),
                 family: f.into(),
                 ..Default::default()

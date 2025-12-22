@@ -1,9 +1,5 @@
 use super::Scan;
 use super::preferences::preference::ScanPrefs;
-use crate::models::Phase;
-use crate::models::Protocol;
-use crate::models::VT;
-use crate::models::scanner::{ScanResultFetcher, ScanResults};
 use crate::nasl::Code;
 use crate::nasl::ScanCtxBuilder;
 use crate::nasl::interpreter::ForkingInterpreter;
@@ -12,7 +8,8 @@ use crate::nasl::nasl_std_functions;
 use crate::nasl::prelude::NaslValue;
 use crate::nasl::utils::Executor;
 use crate::nasl::utils::scan_ctx::Target;
-use crate::scanner::Scanner;
+use crate::scanner::OpenvasdScanner;
+use crate::scanner::{ScanResultFetcher, ScanResults};
 use crate::scanner::{
     error::{ExecuteError, ScriptResult},
     scan_runner::ScanRunner,
@@ -27,7 +24,9 @@ use crate::storage::items::kb::KbContextKey;
 use crate::storage::items::kb::KbItem;
 use crate::storage::items::kb::KbKey;
 use crate::storage::items::nvt::FileName;
-use crate::storage::items::nvt::Nvt;
+use greenbone_scanner_framework::models::Phase;
+use greenbone_scanner_framework::models::Protocol;
+use greenbone_scanner_framework::models::VT;
 
 use futures::StreamExt;
 use std::sync::Arc;
@@ -36,8 +35,9 @@ use tokio::time::Instant;
 use tracing_test::traced_test;
 
 type TestStack = (Arc<InMemoryStorage>, fn(&str) -> String);
+use greenbone_scanner_framework::models::VTData;
 
-fn setup(scripts: &[(String, Nvt)]) -> (TestStack, Executor, Scan) {
+fn setup(scripts: &[(String, VTData)]) -> (TestStack, Executor, Scan) {
     let storage = InMemoryStorage::new();
     scripts.iter().map(|(_, v)| v).for_each(|n| {
         storage
@@ -63,17 +63,17 @@ fn setup(scripts: &[(String, Nvt)]) -> (TestStack, Executor, Scan) {
     ((Arc::new(storage), loader), executor, scan)
 }
 
-fn make_scanner_and_scan_success() -> (Scanner<TestStack>, Scan) {
+fn make_scanner_and_scan_success() -> (OpenvasdScanner<TestStack>, Scan) {
     let ((storage, loader), executor, scan) = setup(&only_success());
-    (Scanner::new(storage, loader, executor), scan)
+    (OpenvasdScanner::new(storage, loader, executor), scan)
 }
 
-fn make_scanner_and_scan(scripts: &[(String, Nvt)]) -> (Scanner<TestStack>, Scan) {
+fn make_scanner_and_scan(scripts: &[(String, VTData)]) -> (OpenvasdScanner<TestStack>, Scan) {
     let ((storage, loader), executor, scan) = setup(scripts);
-    (Scanner::new(storage, loader, executor), scan)
+    (OpenvasdScanner::new(storage, loader, executor), scan)
 }
 
-fn only_success() -> [(String, Nvt); 3] {
+fn only_success() -> [(String, VTData); 3] {
     [
         GenerateScript::with_dependencies("0", &[]).generate(),
         GenerateScript::with_dependencies("1", &["0.nasl"]).generate(),
@@ -89,14 +89,14 @@ fn loader(s: &str) -> String {
 
 #[derive(Debug, Default)]
 struct GenerateScript {
-    pub id: String,
-    pub rc: usize,
-    pub dependencies: Vec<String>,
-    pub required_keys: Vec<String>,
-    pub mandatory_keys: Vec<String>,
-    pub required_tcp_ports: Vec<String>,
-    pub required_udp_ports: Vec<String>,
-    pub exclude: Vec<String>,
+    id: String,
+    rc: usize,
+    dependencies: Vec<String>,
+    required_keys: Vec<String>,
+    mandatory_keys: Vec<String>,
+    required_tcp_ports: Vec<String>,
+    required_udp_ports: Vec<String>,
+    exclude: Vec<String>,
 }
 
 impl GenerateScript {
@@ -158,7 +158,7 @@ impl GenerateScript {
         }
     }
 
-    fn generate(&self) -> (String, Nvt) {
+    fn generate(&self) -> (String, VTData) {
         let keys = |x: &[String]| -> String {
             x.iter().fold(String::default(), |acc, e| {
                 let acc = if acc.is_empty() {
@@ -211,7 +211,7 @@ exit({rc});
     }
 }
 
-fn parse_meta_data(filename: &str, code: &str) -> Option<Nvt> {
+fn parse_meta_data(filename: &str, code: &str) -> Option<VTData> {
     let initial = vec![
         ("description".to_owned(), true.into()),
         ("OPENVAS_VERSION".to_owned(), "testus".into()),
@@ -254,7 +254,7 @@ fn parse_meta_data(filename: &str, code: &str) -> Option<Nvt> {
         .expect("nvt for id")
 }
 
-fn prepare_vt_storage(scripts: &[(String, Nvt)]) -> InMemoryStorage {
+fn prepare_vt_storage(scripts: &[(String, VTData)]) -> InMemoryStorage {
     let dispatcher = InMemoryStorage::new();
     scripts.iter().map(|(_, v)| v).for_each(|n| {
         dispatcher
@@ -265,7 +265,7 @@ fn prepare_vt_storage(scripts: &[(String, Nvt)]) -> InMemoryStorage {
 }
 
 async fn run(
-    scripts: Vec<(String, Nvt)>,
+    scripts: Vec<(String, VTData)>,
     storage: Arc<InMemoryStorage>,
 ) -> Result<Vec<Result<ScriptResult, ExecuteError>>, ExecuteError> {
     let stou = |s: &str| s.split('.').next().unwrap().parse::<usize>().unwrap();
@@ -297,7 +297,7 @@ async fn run(
 }
 
 async fn get_all_results(
-    vts: &[(String, Nvt)],
+    vts: &[(String, VTData)],
     storage: Arc<InMemoryStorage>,
 ) -> (Vec<ScriptResult>, Vec<ScriptResult>) {
     let result = run(vts.to_vec(), storage).await.expect("success run");
@@ -357,7 +357,7 @@ async fn required_ports() {
     assert_eq!(failure.len(), 4);
 }
 
-fn make_test_storage(vts: &[(String, Nvt)]) -> Arc<InMemoryStorage> {
+fn make_test_storage(vts: &[(String, VTData)]) -> Arc<InMemoryStorage> {
     let storage = prepare_vt_storage(vts);
     storage
         .dispatch(
@@ -414,7 +414,11 @@ async fn mandatory_keys() {
     assert_eq!(failure.len(), 1);
 }
 
-async fn wait_for_status(scanner: Scanner<TestStack>, id: &str, phase: Phase) -> ScanResults {
+async fn wait_for_status(
+    scanner: OpenvasdScanner<TestStack>,
+    id: &str,
+    phase: Phase,
+) -> ScanResults {
     const TIMEOUT: u128 = 500;
     let start = Instant::now();
     loop {
@@ -466,8 +470,8 @@ async fn start_scan_failure() {
         "host_info should be set"
     );
     let host_info = scan_results.status.host_info.unwrap();
-    assert_eq!(host_info.finished(), 1);
-    assert_eq!(host_info.queued(), 0);
+    assert_eq!(host_info.finished, 1);
+    assert_eq!(host_info.queued, 0);
 }
 
 #[tokio::test]
@@ -495,6 +499,6 @@ async fn start_scan_success() {
         "host_info should be set"
     );
     let host_info = scan_results.status.host_info.unwrap();
-    assert_eq!(host_info.finished(), 2);
-    assert_eq!(host_info.queued(), 0);
+    assert_eq!(host_info.finished, 2);
+    assert_eq!(host_info.queued, 0);
 }

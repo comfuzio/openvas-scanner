@@ -1,11 +1,18 @@
+use greenbone_scanner_framework::models::PreferenceValue;
+
 // SPDX-FileCopyrightText: 2025 Greenbone AG
 //
 // SPDX-License-Identifier: GPL-2.0-or-later WITH x11vnc-openssl-exception
-use crate::models::PreferenceValue;
+
 use crate::nasl::prelude::*;
 use crate::scanner::preferences::preference::PREFERENCES;
-#[nasl_function(named(id))]
-fn script_get_preference(
+use crate::storage::items::kb::KbKey;
+use crate::storage::items::kb::Ssl;
+use base64::Engine as _;
+use std::io::Write;
+use tempfile::NamedTempFile;
+
+fn script_get_preference_shared(
     register: &Register,
     config: &ScanCtx,
     name: Option<String>,
@@ -42,6 +49,82 @@ fn script_get_preference(
     None
 }
 
+fn script_get_preference_file_content_shared(
+    register: &Register,
+    config: &ScanCtx,
+    name: Option<String>,
+    id: Option<usize>,
+) -> Option<Vec<u8>> {
+    let content = script_get_preference_shared(register, config, name, id)?;
+    let content = content.as_string().unwrap();
+    base64::engine::general_purpose::STANDARD
+        .decode(content)
+        .ok()
+}
+
+/// Given a preference name or ID of file type script preference, stores the
+/// preference value in a temporary file and returns the path.
+// The C implementation of this function, is internally called by nasl_builtin_find_service to
+// store the TLS stuff in temporary files, which are later use to create a tls socket.
+pub fn get_plugin_preference_fname(
+    register: &Register,
+    config: &ScanCtx,
+    name: Option<String>,
+    id: Option<usize>,
+) -> Result<String, FnError> {
+    let mut tmp = match NamedTempFile::with_prefix("openvas-file-upload.") {
+        Ok(f) => f,
+        Err(e) => return Err(BuiltinError::Preference(e.to_string()).into()),
+    };
+    if let Some(file_content) =
+        script_get_preference_file_content_shared(register, config, name, id)
+        && tmp.write_all(&file_content).is_ok()
+    {
+        return Ok(tmp.path().to_string_lossy().into_owned());
+    }
+    Err(BuiltinError::Preference(format!(
+        "get_plugin_preference_fname: Could not create temporary file for {:?}",
+        tmp.path()
+    ))
+    .into())
+}
+
+pub fn plug_set_ssl_cert(config: &ScanCtx, path: String) -> Result<(), FnError> {
+    config.set_single_kb_item(KbKey::Ssl(Ssl::Cert), path)
+}
+
+pub fn plug_set_ssl_key(config: &ScanCtx, path: String) -> Result<(), FnError> {
+    config.set_single_kb_item(KbKey::Ssl(Ssl::Key), path)
+}
+
+pub fn plug_set_ssl_password(config: &ScanCtx, path: String) -> Result<(), FnError> {
+    config.set_single_kb_item(KbKey::Ssl(Ssl::Password), path)
+}
+
+pub fn plug_set_ssl_ca_file(config: &ScanCtx, path: String) -> Result<(), FnError> {
+    config.set_single_kb_item(KbKey::Ssl(Ssl::Ca), path)
+}
+
+#[nasl_function(named(id))]
+fn script_get_preference_file_content(
+    register: &Register,
+    config: &ScanCtx,
+    name: Option<String>,
+    id: Option<usize>,
+) -> Option<Vec<u8>> {
+    script_get_preference_file_content_shared(register, config, name, id)
+}
+
+#[nasl_function(named(id))]
+fn script_get_preference(
+    register: &Register,
+    config: &ScanCtx,
+    name: Option<String>,
+    id: Option<usize>,
+) -> Option<NaslValue> {
+    script_get_preference_shared(register, config, name, id)
+}
+
 #[nasl_function]
 fn get_preference(config: &ScanCtx, name: String) -> Option<NaslValue> {
     let val = if let Some(pref) = config.scan_params().find(|p| p.id == name) {
@@ -76,5 +159,6 @@ function_set! {
     (
         script_get_preference,
         get_preference,
+        script_get_preference_file_content,
     )
 }

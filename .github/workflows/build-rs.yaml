@@ -1,0 +1,55 @@
+name: rs-binaries
+
+on:
+  workflow_call:
+    inputs:
+      arch:
+        description: "amd64 or arm64"
+        required: true
+        type: string
+      runner:
+        description: "runner label"
+        required: true
+        type: string
+
+jobs:
+  build:
+    runs-on: ${{ inputs.runner }}
+    env:
+      ARCH: ${{ inputs.arch }}
+      PLATFORM: linux/${{ inputs.arch }}
+      DIST: dist-${{ inputs.arch }}
+      ARTIFACT_NAME: rs-binaries-${{ inputs.arch }}
+      ASSETS_SUBDIR: assets/linux/${{ inputs.arch }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: build
+        shell: bash
+        run: |
+          docker build \
+            --pull \
+            --target rs-binaries \
+            --platform "${PLATFORM}" \
+            --cache-from=type=gha \
+            --cache-to=type=gha,mode=max \
+            -o type=local,dest="./${DIST}" \
+            -f .docker/prod-oldstable.Dockerfile .
+          mkdir -p "${ASSETS_SUBDIR}"
+          cp "./${DIST}/install/usr/local/bin/openvasd"      "${ASSETS_SUBDIR}/openvasd"
+          cp "./${DIST}/install/usr/local/bin/scannerctl"    "${ASSETS_SUBDIR}/scannerctl"
+          cp "./${DIST}/install/usr/local/bin/feed-verifier" "${ASSETS_SUBDIR}/feed-verifier"
+      # - name: verify
+      #   shell: bash
+      #   run: |
+      #     # I think it is not good that we rely on dynamic libs
+      #     apt update && apt install -y \
+      #         libsnmp-dev
+      #     ${ASSETS_SUBDIR}/openvasd -h
+      #     ${ASSETS_SUBDIR}/scannerctl -h
+      - name: archive
+        uses: actions/upload-artifact@v5
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: assets/*
+          retention-days: 1
+

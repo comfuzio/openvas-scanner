@@ -4,9 +4,11 @@
 
 use crate::alive_test::AliveTestError;
 use crate::alive_test::arp::forge_arp_request;
-use crate::alive_test::common::{alive_test_send_v4_packet, alive_test_send_v6_packet};
 use crate::alive_test::icmp::{forge_icmp_v4, forge_icmp_v6, forge_neighbor_solicit};
-use crate::alive_test::tcp_ping::{FILTER_PORT, forge_tcp_ping_ipv4, forge_tcp_ping_ipv6};
+use crate::nasl::raw_ip_utils::{
+    raw_ip_utils::{FIX_IPV6_HEADER_LENGTH, send_v4_packet, send_v6_packet},
+    tcp_ping::{FILTER_PORT, forge_tcp_ping_ipv4, forge_tcp_ping_ipv6},
+};
 
 use crate::models::{AliveTestMethods, Host};
 use crate::nasl::utils::function::utils::DEFAULT_TIMEOUT;
@@ -30,8 +32,6 @@ use pnet::packet::{
     ipv4::Ipv4Packet,
 };
 
-use super::common::FIX_IPV6_HEADER_LENGTH;
-
 const DEFAULT_PORT_LIST: [u16; 20] = [
     21, 22, 23, 25, 53, 80, 110, 111, 135, 139, 143, 443, 445, 993, 995, 1723, 3306, 3389, 5900,
     8080,
@@ -46,9 +46,9 @@ const BITS_PER_BYTE: usize = 8;
 struct AliveTestCtlStop;
 
 #[derive(Clone)]
-pub struct AliveHostInfo {
+struct AliveHostInfo {
     ip: String,
-    detection_method: AliveTestMethods,
+    detectihttp_method: AliveTestMethods,
 }
 
 struct PktCodec;
@@ -113,20 +113,20 @@ fn process_ipv4_packet(packet: &[u8]) -> Result<Option<AliveHostInfo>, AliveTest
         {
             return Ok(Some(AliveHostInfo {
                 ip: pkt.get_source().to_string(),
-                detection_method: AliveTestMethods::Icmp,
+                detectihttp_method: AliveTestMethods::Icmp,
             }));
         }
     }
     if pkt.get_next_level_protocol() == IpNextHeaderProtocols::Tcp {
         let tcp_packet = TcpPacket::new(&packet[l2_and_ip_header..]).ok_or_else(|| {
-            AliveTestError::CreateIcmpPacketFromWrongBufferSize(
+            AliveTestError::CreateTcpPacketFromWrongBufferSize(
                 packet[l2_and_ip_header..].len() as i64
             )
         })?;
         if tcp_packet.get_destination() == FILTER_PORT {
             return Ok(Some(AliveHostInfo {
                 ip: pkt.get_source().to_string(),
-                detection_method: AliveTestMethods::TcpSyn,
+                detectihttp_method: AliveTestMethods::TcpSyn,
             }));
         }
     }
@@ -146,7 +146,7 @@ fn process_ipv6_packet(packet: &[u8]) -> Result<Option<AliveHostInfo>, AliveTest
         let make_alive_host_ctl = |pkt: Ipv6Packet<'_>, method| {
             Ok(Some(AliveHostInfo {
                 ip: pkt.get_source().to_string(),
-                detection_method: method,
+                detectihttp_method: method,
             }))
         };
         match icmp_pkt.get_icmpv6_type() {
@@ -165,7 +165,7 @@ fn process_ipv6_packet(packet: &[u8]) -> Result<Option<AliveHostInfo>, AliveTest
         if tcp_packet.get_destination() == FILTER_PORT {
             return Ok(Some(AliveHostInfo {
                 ip: pkt.get_source().to_string(),
-                detection_method: AliveTestMethods::TcpSyn,
+                detectihttp_method: AliveTestMethods::TcpSyn,
             }));
         }
     }
@@ -179,7 +179,7 @@ fn process_arp_frame(frame: &[u8]) -> Result<Option<AliveHostInfo>, AliveTestErr
     if arp.get_operation() == ArpOperations::Reply {
         return Ok(Some(AliveHostInfo {
             ip: arp.get_sender_proto_addr().to_string(),
-            detection_method: AliveTestMethods::Arp,
+            detectihttp_method: AliveTestMethods::Arp,
         }));
     }
     Ok(None)
@@ -253,11 +253,11 @@ async fn send_task(
             match t {
                 IpAddr::V4(ipv4) => {
                     let icmp = forge_icmp_v4(*ipv4);
-                    alive_test_send_v4_packet(icmp)?;
+                    send_v4_packet(icmp)?;
                 }
                 IpAddr::V6(ipv6) => {
                     let icmp = forge_icmp_v6(*ipv6)?;
-                    alive_test_send_v6_packet(icmp)?;
+                    send_v6_packet(icmp)?;
                 }
             }
         }
@@ -270,12 +270,12 @@ async fn send_task(
                     IpAddr::V4(ipv4) => {
                         let tcp =
                             forge_tcp_ping_ipv4(*ipv4, port, pnet::packet::tcp::TcpFlags::SYN)?;
-                        alive_test_send_v4_packet(tcp)?;
+                        send_v4_packet(tcp)?;
                     }
                     IpAddr::V6(ipv6) => {
                         let tcp =
                             forge_tcp_ping_ipv6(*ipv6, port, pnet::packet::tcp::TcpFlags::SYN)?;
-                        alive_test_send_v6_packet(tcp)?;
+                        send_v6_packet(tcp)?;
                     }
                 };
             }
@@ -289,12 +289,12 @@ async fn send_task(
                     IpAddr::V4(ipv4) => {
                         let tcp =
                             forge_tcp_ping_ipv4(*ipv4, port, pnet::packet::tcp::TcpFlags::ACK)?;
-                        alive_test_send_v4_packet(tcp)?;
+                        send_v4_packet(tcp)?;
                     }
                     IpAddr::V6(ipv6) => {
                         let tcp =
                             forge_tcp_ping_ipv6(*ipv6, port, pnet::packet::tcp::TcpFlags::ACK)?;
-                        alive_test_send_v6_packet(tcp)?;
+                        send_v6_packet(tcp)?;
                     }
                 };
             }
@@ -309,7 +309,7 @@ async fn send_task(
                 }
                 IpAddr::V6(ipv6) => {
                     let ndp = forge_neighbor_solicit(*ipv6)?;
-                    alive_test_send_v6_packet(ndp)?;
+                    send_v6_packet(ndp)?;
                 }
             };
         }
@@ -364,7 +364,7 @@ impl Scanner {
         while let Some(alivehost) = rx_msg.recv().await {
             if self.target.contains(&alivehost.ip) && !alive.contains(&alivehost.ip) {
                 alive.insert(alivehost.ip.clone());
-                println!("{} via {:?}", &alivehost.ip, &alivehost.detection_method);
+                println!("{} via {:?}", &alivehost.ip, &alivehost.detectihttp_method);
             }
         }
 

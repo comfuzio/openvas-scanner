@@ -2,10 +2,10 @@
 //
 // SPDX-License-Identifier: GPL-2.0-or-later WITH x11vnc-openssl-exception
 
-use russh::cipher;
-use russh_keys::key;
+use std::str::FromStr;
 
 use crate::nasl::{prelude::*, utils::function::StringOrData};
+use russh::{cipher, keys::Algorithm};
 
 /// A list of items which are represented as a
 /// NASL string which contains the items separated by
@@ -19,7 +19,8 @@ where
     fn from_nasl_value(value: &'a NaslValue) -> Result<Self, FnError> {
         let s = StringOrData::from_nasl_value(value)?;
         Ok(Self(
-            s.0.split(",")
+            s.string()
+                .split(",")
                 .filter(|s| s != &"")
                 .map(|substr| {
                     let nasl_val = NaslValue::String(substr.to_string());
@@ -30,11 +31,11 @@ where
     }
 }
 
-impl<'a> FromNaslValue<'a> for key::Name {
+impl<'a> FromNaslValue<'a> for Algorithm {
     fn from_nasl_value(value: &'a NaslValue) -> Result<Self, FnError> {
         let s = String::from_nasl_value(value)?;
-        key::Name::try_from(&*s).map_err(|_| {
-            ArgumentError::WrongArgument(format!("Expected a valid SSH key type, found '{s}'"))
+        Algorithm::from_str(&s).map_err(|_| {
+            ArgumentError::WrongArgument(format!("Expected a valid SSH key algorithm, found '{s}'"))
                 .into()
         })
     }

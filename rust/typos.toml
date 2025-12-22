@@ -1,6 +1,8 @@
 [default.extend-identifiers]
 OpenVAS = "OpenVAS"
 des_ede_cbc_encrypt = "des_ede_cbc_encrypt"
+ede = "ede"
+TdesEde3 = "TdesEde3"
 typ = "typ"
 
 [default.extend-words]
@@ -12,6 +14,7 @@ nversion = "nversion"
 
 [files]
 extend-exclude = [
+    "test-data/*",
     "data/osp/response_*.xml",
     "crates/smoketest/configs/client_sample.cert",
     "*.notus",
