@@ -7,24 +7,24 @@ use container_image_scanner::{
     image::{Credential, Image, ImageID, packages::ToNotus},
 };
 use db::{ProcessingImage, RequestedScans};
-use futures::future::join_all;
 use greenbone_scanner_framework::models;
-use scanner::ScannerError;
 use sqlx::{Sqlite, SqlitePool};
 use tokio::{
     sync::{
         RwLock,
         mpsc::{Receiver, Sender},
     },
+    task::JoinSet,
     time,
 };
-use tracing::{debug, warn};
+use tracing::{debug, instrument, warn};
 
 use crate::container_image_scanner::{
     self,
-    messages::{self, CustomerMessage},
+    messages::CustomerMessage,
+    scheduling::scanner::{ScannerArchImageError, ScannerError},
 };
-use scannerlib::notus::{HashsumProductLoader, Notus};
+use scannerlib::notus::{HashsumProductLoader, Notus, NotusError};
 
 // TODO: refactor, this got a bit too messy
 pub mod db;
@@ -89,12 +89,7 @@ struct InitializedRegistry<'a, Registry> {
     registry: Registry,
 }
 
-#[derive(thiserror::Error, Debug)]
-#[error(transparent)]
-enum ScanImageError {
-    ScannerError(#[from] ScannerError),
-    RegistryErrir(#[from] ExternalError),
-}
+use crate::container_image_scanner::image::RegistryError;
 
 impl<R, E> Scheduler<R, E>
 where
@@ -120,20 +115,26 @@ where
         pool: &sqlx::Pool<Sqlite>,
         id: &str,
         credentials: Option<Credential>,
-    ) -> Result<R, ExternalError> {
+    ) -> Result<R, RegistryError> {
         let result = db::preferences(pool, id);
         let prefs = image::RegistrySetting::parse_preferences(result).await;
         R::initialize(credentials, prefs)
     }
 
+    #[instrument(skip_all, fields(id = pimage.id))]
     async fn resolve_all_images(
         pool: sqlx::Pool<Sqlite>,
-        image: &ProcessingImage,
-    ) -> Result<Vec<Result<Image, ExternalError>>, ExternalError> {
-        let registry = Self::registry(&pool, &image.id, image.credentials.clone()).await?;
+        pimage: &ProcessingImage,
+    ) -> Result<Vec<Result<Image, RegistryError>>, ExternalError> {
+        let registry = Self::registry(&pool, &pimage.id, pimage.credentials.clone()).await?;
 
         let mut result = Vec::with_capacity(100);
-        for image in image.image.iter().map(|x| x.clone().map_err(|e| e.into())) {
+        for image in pimage
+            .image
+            .iter()
+            //TODO: refactor ResolveRequested this is just needlessly annoying
+            .map(|x| x.clone().map_err(|_| RegistryError::no_repository()))
+        {
             match image {
                 Err(e) => result.push(Err(e)),
                 Ok(x) => {
@@ -143,12 +144,14 @@ where
             }
         }
 
+        tracing::debug!(id = pimage.id, images = result.len(), "Found");
         Ok(result)
     }
 
+    #[instrument(skip_all, fields(id=image.id))]
     pub(crate) async fn resolve_and_store_images(
-        image: ProcessingImage,
         pool: sqlx::Pool<Sqlite>,
+        image: ProcessingImage,
     ) -> Result<(), sqlx::Error> {
         db::set_scan_to_running(&pool, &image.id).await?;
         let images = match Self::resolve_all_images(pool.clone(), &image).await {
@@ -169,15 +172,21 @@ where
     ) where
         T: ToNotus,
     {
-        let max_concurrent_scans = 2;
-
-        let requested = RequestedScans::fetch(&pool, max_concurrent_scans).await;
+        let requested = RequestedScans::fetch(&pool, config.max_scans).await;
+        let mut js = JoinSet::new();
         for r in requested {
-            if let Err(error) = Self::resolve_and_store_images(r, pool.clone()).await {
-                tracing::warn!(%error, "Unable to set image status after fetching the images");
-            }
+            let pool = pool.clone();
+            js.spawn(async move {
+                if let Err(error) = Self::resolve_and_store_images(pool, r).await {
+                    tracing::warn!(%error, "Unable to set image status after fetching the images");
+                }
+            });
         }
-        Self::scan_images::<T>(config, pool.clone(), products).await;
+        let tsp = pool.clone();
+        js.spawn(async move {
+            Self::scan_images::<T>(config, tsp, products).await;
+        });
+        js.join_all().await;
         if let Err(error) = db::set_scans_to_finished(&pool).await {
             tracing::warn!(%error, "Unable to set scans to finished");
         }
@@ -188,6 +197,7 @@ where
         pool: &sqlx::Pool<Sqlite>,
     ) -> Result<Vec<(ImageID, Option<Credential>)>, sqlx::error::Error> {
         let mut tx = pool.begin().await?;
+
         let scan_limit = match config.image_max_scanning() {
             0 => -1,
             max => {
@@ -247,31 +257,77 @@ where
         Ok(result)
     }
 
+    #[instrument(skip_all, fields(id=id.id(), image=id.image()))]
     async fn scan_image<T>(
         config: Arc<Config>,
         pool: sqlx::Pool<Sqlite>,
         products: Arc<RwLock<Notus<HashsumProductLoader>>>,
         id: &ImageID,
         credentials: Option<Credential>,
-    ) -> Result<(), ScanImageError>
-    where
+    ) where
         T: ToNotus,
     {
-        let registry = Self::registry(&pool, id.id(), credentials)
-            .await
-            .map_err(ScanImageError::RegistryErrir)?;
+        match Self::registry(&pool, id.id(), credentials).await {
+            Ok(registry) => {
+                let registry = InitializedRegistry { id, registry };
 
-        let registry = InitializedRegistry { id, registry };
+                match scanner::scan_image::<E, R, T>(
+                    config.clone(),
+                    pool.clone(),
+                    products,
+                    &registry,
+                )
+                .await
+                {
+                    Ok(_) => {
+                        db::image_success(&pool, id).await;
+                    }
+                    Err(err) => {
+                        // Notus error should not set a scan to failed
+                        if err
+                            .iter()
+                            .filter_map(|x| match x {
+                                ScannerError::Image(ScannerArchImageError::Notus(
+                                    NotusError::UnknownProduct(_),
+                                )) => None,
+                                ScannerError::Image(_)
+                                | ScannerError::Extractor(_)
+                                | ScannerError::ImageParseError(_)
+                                | ScannerError::RegistryError(_) => Some(true),
+                            })
+                            .any(|x| x)
+                        {
+                            db::image_failed(&pool, id).await;
+                        } else {
+                            db::image_success(&pool, id).await;
+                        }
+                        for e in err {
+                            if let ScannerError::Image(ScannerArchImageError::Notus(
+                                NotusError::UnknownProduct(product),
+                            )) = &e
+                            {
+                                tracing::info!(
+                                    product,
+                                    "Not found in notus products. This is not considered a scan failure reason."
+                                );
+                            } else {
+                                tracing::warn!(error=%e, "This is considered a scan failure reason.");
+                            }
+                            CustomerMessage::error(Some(id.image.clone()), format!("{e}"), None)
+                                .store(&pool, id.id())
+                                .await;
+                        }
+                    }
+                }
+            }
 
-        scanner::scan_image::<E, R, T>(config.clone(), pool.clone(), products, &registry)
-            .await
-            .map_err(ScanImageError::ScannerError)
+            Err(error) => tracing::warn!(%error, "Unable to initiate registry"),
+        }
     }
 
     async fn scan_images<T>(
         config: Arc<Config>,
         pool: sqlx::Pool<Sqlite>,
-
         products: Arc<RwLock<Notus<HashsumProductLoader>>>,
     ) where
         T: ToNotus,
@@ -279,57 +335,16 @@ where
         let scans = Self::set_images_to_scanning(config.clone(), &pool)
             .await
             .unwrap();
-        let join_handler = scans
-            .into_iter()
-            .map(|(id, credentials)| {
-                let pool = pool.clone();
-                let config = config.clone();
-                let products = products.clone();
-                tokio::task::spawn(async move {
-                    let result =
-                        Self::scan_image::<T>(config, pool.clone(), products, &id, credentials)
-                            .await;
-                    match result {
-                        Ok(_) => {
-                            if let Err(e) = db::image_success(&pool, &id).await {
-                                warn!(error = %e, ?id, "Unable to update scan hosts information.");
-                            }
-                        }
-                        Err(err) => {
-                            tracing::warn!(error=%err);
-                            if let Err(e) = db::image_failed(&pool, &id).await {
-                                warn!(error = %e, ?id, "Unable to update scan hosts information.");
-                            }
-                            let msgs = match &err {
-                                ScanImageError::ScannerError(
-                                    //TODO: The name and design is misleading.
-                                    scanner::ScannerError::NonInterrupting(items),
-                                ) => items
-                                    .iter()
-                                    .map(|msg| {
-                                        CustomerMessage::error(
-                                            Some(id.image.clone()),
-                                            msg.to_owned(),
-                                            None,
-                                        )
-                                    })
-                                    .collect(),
-                                e => {
-                                    vec![CustomerMessage::error(
-                                        Some(id.image.clone()),
-                                        format!("Unable to scan image: {e}."),
-                                        None,
-                                    )]
-                                }
-                            };
-                            messages::store(&pool, id.id(), &msgs).await
-                        }
-                    }
-                })
-            })
-            .collect::<Vec<_>>();
-
-        join_all(join_handler).await;
+        let mut js = JoinSet::new();
+        for (id, credentials) in scans {
+            let pool = pool.clone();
+            let config = config.clone();
+            let products = products.clone();
+            js.spawn(async move {
+                Self::scan_image::<T>(config, pool.clone(), products, &id, credentials).await;
+            });
+        }
+        js.join_all().await;
     }
 
     pub(crate) async fn check_for_message(&mut self) -> Option<()> {

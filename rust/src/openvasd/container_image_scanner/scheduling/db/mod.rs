@@ -9,7 +9,7 @@ use tracing::debug;
 
 use crate::container_image_scanner::{
     ExternalError,
-    image::{Credential, Image, ImageID, ImageParseError},
+    image::{Credential, Image, ImageID, ImageParseError, RegistryError},
 };
 
 impl From<SqliteRow> for ImageID {
@@ -208,13 +208,14 @@ pub async fn set_scan_to_failed(pool: &Pool<Sqlite>, id: &str) -> Result<(), sql
 pub async fn set_scan_images(
     pool: &Pool<Sqlite>,
     id: &str,
-    images: Vec<Result<Image, Box<dyn std::error::Error + Send + Sync>>>,
+    images: Vec<Result<Image, RegistryError>>,
 ) -> Result<(), sqlx::Error> {
     let mut conn = pool.acquire().await?;
     let mut tx = conn.begin().await?;
-    let success_count = images.iter().filter(|x| x.is_ok()).count();
-    let dead_count = images.iter().filter(|x| x.is_err()).count();
     let count = images.len();
+    let dead_count = images.iter().filter(|x| x.is_err()).count();
+    // TODO: remove all that are within excluded_hosts
+    let success_count = images.iter().filter(|x| x.is_ok()).count();
     query(
         r#"
             UPDATE scans
@@ -233,7 +234,6 @@ pub async fn set_scan_images(
         let mut builder = QueryBuilder::new("INSERT OR IGNORE INTO images (id, image)");
         builder.push_values(images.into_iter().filter_map(|x| x.ok()), |mut b, image| {
             let oci = image.to_string();
-            tracing::debug!(oci, "Resolved");
             b.push_bind(id).push_bind(oci);
         });
         let query = builder.build();
@@ -244,6 +244,7 @@ pub async fn set_scan_images(
     Ok(())
 }
 
+// TODO: move to Images::change_status
 fn set_image_status<'a>(
     ids: &'a ImageID,
     status: &'a str,
@@ -259,14 +260,16 @@ fn set_image_status<'a>(
     .bind(ids.image())
 }
 
-pub async fn image_failed(pool: &sqlx::Pool<Sqlite>, id: &ImageID) -> Result<(), ExternalError> {
-    set_image_status(id, "failed").execute(pool).await?;
-    Ok(())
+pub async fn image_failed(pool: &sqlx::Pool<Sqlite>, id: &ImageID) {
+    if let Err(error) = set_image_status(id, "failed").execute(pool).await {
+        tracing::warn!(%error, "Unable to set status to failed.")
+    }
 }
 
-pub async fn image_success(pool: &sqlx::Pool<Sqlite>, id: &ImageID) -> Result<(), ExternalError> {
-    set_image_status(id, "succeeded").execute(pool).await?;
-    Ok(())
+pub async fn image_success(pool: &sqlx::Pool<Sqlite>, id: &ImageID) {
+    if let Err(error) = set_image_status(id, "succeeded").execute(pool).await {
+        tracing::warn!(%error, "Unable to set status to succeeded.")
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -294,6 +297,7 @@ impl Iterator for RequestedScans {
 
 impl RequestedScans {
     pub async fn fetch(pool: &Pool<Sqlite>, limit: usize) -> RequestedScans {
+        let limit = if limit == 0 { -1 } else { limit as i64 };
         let mut stream = sqlx::query(
             r#"
         WITH running_count AS (
@@ -323,7 +327,7 @@ impl RequestedScans {
           ON r.id = c.id
         "#,
         )
-        .bind(limit as i64)
+        .bind(limit)
         .fetch(pool);
         type ImageResult = Result<Image, ImageParseError>;
 
