@@ -18,6 +18,8 @@ check_interval = "3600s"
 products_path = "/var/lib/notus/products/"
 # path to the notus advisories feed. This is required for the /vts endpoint
 advisories_path = "/var/lib/notus/advisories/"
+# Address to reach notus on. If not set, internal notus implementation is used.
+# address = "127.0.0.1:3001"
 
 [endpoints]
 # Enables GET /scans endpoint
@@ -87,12 +89,18 @@ max_connections = 1
 
 [container_image_scanner.image]
 extract_to = '/tmp/openvasd/cis'
-# Configures the amount of images that may be scanned concurrently
-max_scanning = 10
 # How many times an image scan should be retried on a failure that is retryable
 scanning_retries = 10
-# Configures the amount of images that should be processed in one batch synchronously
+# Configures the amount of images that may be scanned concurrently
+# The recommended configuration of max_scanning and batch_size is:
+# 10:2 for a 1000mb/s
+# 25:2 for a 2500mb/s
+# 50:2 for a 5000mb/s
+# 100:2 for a 10000mb/s
+# Assuming a median size of 100mb per image.
+max_scanning = 10
+# Configures the amount of images that should be processed in one batch synchronously.
+# Additionally this controls the amount of seconds a loop checks if images can be scanned.
 batch_size = 2
 # How long openvasd should pause before retrying
 retry_timeout = "1s"
-

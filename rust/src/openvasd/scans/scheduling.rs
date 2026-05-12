@@ -4,14 +4,16 @@ use tokio::sync::RwLock;
 use greenbone_scanner_framework::models::{self, Scan};
 use scannerlib::{
     models::FeedType,
+    nasl::{builtin::nasl_std_functions, syntax::Loader},
     openvas::{self, cmd},
     osp,
     scanner::{
-        Lambda, ScanDeleter, ScanResultFetcher, ScanResultKind, ScanStarter, ScanStopper,
+        OpenvasdScanner, ScanDeleter, ScanResultFetcher, ScanResultKind, ScanStarter, ScanStopper,
         preferences,
     },
 };
-use sqlx::{QueryBuilder, SqlitePool, query_scalar};
+
+use crate::database::sqlite::scan_storage::ScanStorage;
 use tokio::{
     sync::mpsc::{self, Sender},
     time::MissedTickBehavior,
@@ -20,7 +22,10 @@ use tokio::{
 use crate::{
     config::Config,
     crypt::Crypt,
-    scans::state_change::ScanStateController,
+    database::{
+        dao::{Fetch, RetryExec},
+        sqlite::{DataBase, results::DBResults, scans::ScanDB, state_change::ScanStateController},
+    },
     vts::orchestrator::{self, FeedStatusChange},
 };
 
@@ -94,7 +99,7 @@ impl IsInProgress {
 }
 
 struct ScanScheduler<Scanner, Cryptor> {
-    pool: SqlitePool,
+    pool: DataBase,
     cryptor: Arc<Cryptor>,
     scanner: Arc<Scanner>,
     max_concurrent_scan: usize,
@@ -137,10 +142,14 @@ impl<T, C> ScanScheduler<T, C> {
         Ok(())
     }
 
-    async fn scan_stored_to_requested(&self, id: i64) -> R<()> {
+    async fn scan_to_requested(&self, id: i64) -> R<()> {
         self.scan_state
             .change_state(id, "stored", "requested")
             .await?;
+        self.scan_state
+            .change_state(id, "stopped", "requested")
+            .await?;
+
         Ok(())
     }
 
@@ -157,40 +166,11 @@ impl<T, C> ScanScheduler<T, C> {
     }
 
     async fn scan_insert_results(&self, id: i64, results: Vec<models::Result>) -> R<()> {
-        if !results.is_empty() {
-            let offset: i64 =
-                query_scalar("SELECT count(result_id) AS count FROM results WHERE id = ?")
-                    .bind(id)
-                    .fetch_one(&self.pool)
-                    .await?;
-            tracing::trace!(offset, id, ?results);
-            QueryBuilder::new(
-                r#"INSERT INTO results (
-                    id, result_id, type, ip_address, hostname, oid, port, protocol, message, 
-                    detail_name, detail_value, 
-                    source_type, source_name, source_description
-                )"#,
-            )
-            .push_values(results.into_iter().enumerate(), |mut b, (idx, result)| {
-                b.push_bind(id)
-                    .push_bind(offset + idx as i64)
-                    .push_bind(result.r_type.to_string())
-                    .push_bind(result.ip_address)
-                    .push_bind(result.hostname)
-                    .push_bind(result.oid)
-                    .push_bind(result.port)
-                    .push_bind(result.protocol.map(|p| p.to_string()))
-                    .push_bind(result.message)
-                    .push_bind(result.detail.as_ref().map(|d| d.name.clone()))
-                    .push_bind(result.detail.as_ref().map(|d| d.value.clone()))
-                    .push_bind(result.detail.as_ref().map(|d| d.source.s_type.clone()))
-                    .push_bind(result.detail.as_ref().map(|d| d.source.name.clone()))
-                    .push_bind(result.detail.as_ref().map(|d| d.source.description.clone()));
-            })
-            .build()
-            .execute(&self.pool)
+        // TODO: maybe better to use i64 in the impl?
+        let id: &str = &id.to_string();
+        DBResults::new(&self.pool, (id, &results as &[_]))
+            .retry_exec()
             .await?;
-        }
         Ok(())
     }
 }
@@ -247,10 +227,9 @@ where
             .scan_state
             .change_state(id, "requested", "running")
             .await?;
-
-        let mut tx = self.pool.begin().await?;
-        let scan = super::get_scan(&mut tx, self.cryptor.as_ref(), id).await?;
-        tx.commit().await?;
+        let scan = ScanDB::new(&self.pool, (self.cryptor.as_ref(), id))
+            .fetch()
+            .await?;
 
         tracing::info!(id, running, "Started scan");
 
@@ -328,10 +307,7 @@ where
             .await?;
 
         for id in scans {
-            let scan_id = query_scalar("SELECT scan_id FROM client_scan_map WHERE id = ?")
-                .bind(id)
-                .fetch_one(&self.pool)
-                .await?;
+            let scan_id = ScanDB::new(&self.pool, id).fetch().await?;
             if let Err(error) = self.scan_import_results(id, scan_id).await {
                 // we don't return error here as other imports may succeed
                 tracing::warn!(id, %error, "Unable to import results of scan.");
@@ -348,10 +324,8 @@ where
     }
 
     async fn scan_stop(&self, id: i64) -> R<()> {
-        let scan_id: String = query_scalar("SELECT scan_id FROM client_scan_map WHERE id = ?")
-            .bind(id)
-            .fetch_one(&self.pool)
-            .await?;
+        let scan_id: String = ScanDB::new(&self.pool, id).fetch().await?;
+
         self.scan_import_results(id, scan_id.clone()).await?;
         self.scanner.stop_scan(scan_id.clone()).await?;
 
@@ -366,7 +340,7 @@ where
 
     async fn on_user_action(&self, message: &Message) -> R<()> {
         match message {
-            Message::Start(id) => self.scan_stored_to_requested(id.parse()?).await?,
+            Message::Start(id) => self.scan_to_requested(id.parse()?).await?,
             Message::Stop(id) => self.scan_stop(id.parse()?).await?,
         };
         Ok(())
@@ -401,8 +375,8 @@ where
     }
 
     async fn get_running_count(&self) -> i64 {
-        match query_scalar("SELECT count(id) FROM scans WHERE status = 'running'")
-            .fetch_one(&self.pool)
+        match ScanDB::new(&self.pool, models::Phase::Running)
+            .fetch()
             .await
         {
             Ok(x) => x,
@@ -426,10 +400,7 @@ where
 
     async fn on_schedule(&self) -> R<Vec<orchestrator::Allow>> {
         if self.contains_need().await {
-            let count_running: i64 =
-                query_scalar("SELECT count(id) FROM scans WHERE status = 'running'")
-                    .fetch_one(&self.pool)
-                    .await?;
+            let count_running = self.get_running_count().await;
             if count_running == 0 {
                 return Ok(self.need_to_allow().await);
             }
@@ -514,7 +485,7 @@ where
 }
 
 pub(super) async fn init_with_scanner<E, S>(
-    pool: SqlitePool,
+    pool: DataBase,
     crypter: Arc<E>,
     config: &Config,
     scanner: S,
@@ -538,7 +509,7 @@ where
 }
 
 pub async fn init<E>(
-    pool: SqlitePool,
+    pool: DataBase,
     crypter: Arc<E>,
     config: &Config,
     feed_status: orchestrator::Communicator,
@@ -577,7 +548,14 @@ where
             init_with_scanner(pool, crypter, config, scanner, feed_status).await
         }
         crate::config::ScannerType::Openvasd => {
-            let scanner: Lambda = Lambda::default();
+            let loader = Loader::from_feed_path(&config.feed.path);
+            let executor = nasl_std_functions();
+            let notus = config
+                .notus
+                .address
+                .map(scannerlib::nasl::utils::scan_ctx::NotusCtx::Address);
+            let storage = ScanStorage::new(pool.clone());
+            let scanner = OpenvasdScanner::new(storage, loader, executor, notus);
             init_with_scanner(pool, crypter, config, scanner, feed_status).await
         }
     }
@@ -589,6 +567,7 @@ pub(crate) mod tests {
         models::Status,
         scanner::{self, LambdaBuilder, ScanResults},
     };
+    use sqlx::query_scalar;
 
     use super::*;
     use crate::{

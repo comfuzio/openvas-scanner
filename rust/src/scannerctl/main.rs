@@ -7,7 +7,6 @@
 // but should eventually solve this.
 #![allow(clippy::result_large_err)]
 
-#[cfg(feature = "nasl-builtin-raw-ip")]
 mod alivetest;
 mod error;
 mod execute;
@@ -87,8 +86,8 @@ enum Action {
     Execute(ExecuteArgs),
     NotusUpdate(NotusUpdateArgs),
     Feed(FeedArgs),
-    #[cfg(feature = "nasl-builtin-raw-ip")]
     Alivetest(alivetest::AliveTestArgs),
+    Version,
 }
 
 #[tokio::main]
@@ -124,8 +123,11 @@ async fn run(action: Action, verbose: bool, quiet: bool) -> Result<(), CliError>
         Action::Execute(args) => execute::run(args).await,
         Action::NotusUpdate(args) => notus_update::scanner::run(args).await,
         Action::Feed(args) => feed::run(args).await,
-        #[cfg(feature = "nasl-builtin-raw-ip")]
         Action::Alivetest(args) => alivetest::run(args).await,
+        Action::Version => {
+            scannerlib::utils::version::show_version("scannerctl");
+            Ok(())
+        }
     }
 }
 

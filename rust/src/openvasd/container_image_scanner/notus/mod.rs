@@ -1,10 +1,13 @@
+// We allow this fow now, since it would require lots of changes
+// but should eventually solve this.
+#![allow(clippy::result_large_err)]
 use std::{collections::HashMap, sync::Arc};
 
 use greenbone_scanner_framework::models::{self, FixedVersion, VulnerablePackage};
 use tokio::sync::RwLock;
 
 use crate::container_image_scanner::detection::OperatingSystem;
-use scannerlib::notus::{HashsumProductLoader, Notus, NotusError};
+use scannerlib::notus::{Notus, NotusError};
 
 /// Some products have unique requirements that we have to generate somehow.
 ///
@@ -87,7 +90,7 @@ fn to_result(image: String, digest: Option<String>, results: NotusResults) -> Ve
         .collect()
 }
 
-type Oz = Notus<HashsumProductLoader>;
+type Oz = Notus;
 
 pub async fn vulnerabilities(
     products: Arc<RwLock<Oz>>,

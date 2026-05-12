@@ -13,6 +13,7 @@ use scannerlib::nasl::{
     NaslValue, WithErrorInfo,
     interpreter::InterpreterErrorKind,
     syntax::{LoadError, Loader, read_non_utf8_path},
+    utils::scan_ctx::NotusCtx,
 };
 use scannerlib::{
     feed,
@@ -38,13 +39,14 @@ use greenbone_scanner_framework::models::VTData;
 
 use crate::{CliError, CliErrorKind, Db, Filename};
 
-fn load(ctx: &ScanCtx, script: &Path) -> Result<String, CliErrorKind> {
+async fn load(ctx: &ScanCtx<'_>, script: &Path) -> Result<String, CliErrorKind> {
     match read_non_utf8_path(&script) {
         Ok(x) => Ok(x),
         Err(LoadError::NotFound(_)) => {
             match ctx
                 .storage()
-                .retrieve(&Oid(script.to_string_lossy().to_string()))?
+                .retrieve(&Oid(script.to_string_lossy().to_string()))
+                .await?
             {
                 Some(vt) => Ok(ctx.loader().load(&vt.filename)?),
                 _ => Err(LoadError::NotFound(script.to_string_lossy().to_string()).into()),
@@ -56,7 +58,7 @@ fn load(ctx: &ScanCtx, script: &Path) -> Result<String, CliErrorKind> {
 
 async fn run_with_context(context: ScanCtx<'_>, script: &Path) -> Result<(), CliErrorKind> {
     let register = Register::default();
-    let code = Code::from_string_filename(&load(&context, script)?, script);
+    let code = Code::from_string_filename(&load(&context, script).await?, script);
     let (ast, file) = code
         .parse()
         .emit_errors_get_ast_and_file()
@@ -123,6 +125,8 @@ fn load_feed_by_json(store: &InMemoryStorage, path: &PathBuf) -> Result<(), CliE
     Ok(())
 }
 
+// TODO: Redesign
+#[allow(clippy::too_many_arguments)]
 async fn run_on_storage<S: ContextStorage>(
     storage: S,
     loader: Loader,
@@ -131,6 +135,7 @@ async fn run_on_storage<S: ContextStorage>(
     ports: Ports,
     script: &Path,
     scan_preferences: ScanPrefs,
+    notus: Option<NotusCtx>,
 ) -> Result<(), CliErrorKind> {
     let scan_id = ScanID(format!("scannerctl-{}", script.to_string_lossy()));
     let filename = script;
@@ -144,6 +149,7 @@ async fn run_on_storage<S: ContextStorage>(
                 let storage_ctx = KbContextKey(kbctx.clone(), k.into());
                 let _ = storage
                     .dispatch(storage_ctx, v.into())
+                    .await
                     .map_err(CliErrorKind::StorageError);
             }
             None => return Err(CliErrorKind::InvalidCmdOpt(s.to_string())),
@@ -160,6 +166,7 @@ async fn run_on_storage<S: ContextStorage>(
         filename,
         scan_preferences,
         alive_test_methods: Vec::new(),
+        notus,
     };
     run_with_context(cb.build(), script).await
 }
@@ -174,6 +181,7 @@ pub async fn run(
     tcp_ports: Vec<u16>,
     udp_ports: Vec<u16>,
     scan_preferences: ScanPrefs,
+    notus: Option<NotusCtx>,
 ) -> Result<(), CliError> {
     let target = target
         .map(|target| {
@@ -182,8 +190,8 @@ pub async fn run(
         })
         .unwrap_or(Target::localhost());
     let ports = Ports {
-        tcp: BTreeSet::from_iter(tcp_ports.into_iter()),
-        udp: BTreeSet::from_iter(udp_ports.into_iter()),
+        tcp: BTreeSet::from_iter(tcp_ports),
+        udp: BTreeSet::from_iter(udp_ports),
     };
 
     let result = match (db, feed) {
@@ -196,6 +204,7 @@ pub async fn run(
                 ports,
                 script,
                 scan_preferences,
+                notus,
             )
             .await
         }
@@ -208,7 +217,17 @@ pub async fn run(
             } else {
                 load_feed_by_exec(&storage, &loader).await?
             }
-            run_on_storage(storage, loader, target, kb, ports, script, scan_preferences).await
+            run_on_storage(
+                storage,
+                loader,
+                target,
+                kb,
+                ports,
+                script,
+                scan_preferences,
+                notus,
+            )
+            .await
         }
     };
 

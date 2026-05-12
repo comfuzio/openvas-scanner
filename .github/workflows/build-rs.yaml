@@ -11,6 +11,11 @@ on:
         description: "runner label"
         required: true
         type: string
+      binary_version:
+        description: "Binary version"
+        required: false
+        type: string
+
 
 jobs:
   build:
@@ -21,9 +26,10 @@ jobs:
       DIST: dist-${{ inputs.arch }}
       ARTIFACT_NAME: rs-binaries-${{ inputs.arch }}
       ASSETS_SUBDIR: assets/linux/${{ inputs.arch }}
+      BIN_VERSION: ${{ inputs.binary_version }}
     steps:
       - uses: actions/checkout@v6
-      - name: build
+      - name: build ${{ inputs.arch }}
         shell: bash
         run: |
           docker build \
@@ -32,12 +38,14 @@ jobs:
             --platform "${PLATFORM}" \
             --cache-from=type=gha \
             --cache-to=type=gha,mode=max \
+            --build-arg "BIN_VERSION=${BIN_VERSION}" \
+            --build-arg "VERSION=oldstable" \
+            --build-arg "RUST_IMAGE=rust:bookworm" \
             -o type=local,dest="./${DIST}" \
-            -f .docker/prod-oldstable.Dockerfile .
+            -f .docker/prod.Dockerfile .
           mkdir -p "${ASSETS_SUBDIR}"
           cp "./${DIST}/install/usr/local/bin/openvasd"      "${ASSETS_SUBDIR}/openvasd"
           cp "./${DIST}/install/usr/local/bin/scannerctl"    "${ASSETS_SUBDIR}/scannerctl"
-          cp "./${DIST}/install/usr/local/bin/feed-verifier" "${ASSETS_SUBDIR}/feed-verifier"
       # - name: verify
       #   shell: bash
       #   run: |
@@ -47,7 +55,7 @@ jobs:
       #     ${ASSETS_SUBDIR}/openvasd -h
       #     ${ASSETS_SUBDIR}/scannerctl -h
       - name: archive
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ env.ARTIFACT_NAME }}
           path: assets/*

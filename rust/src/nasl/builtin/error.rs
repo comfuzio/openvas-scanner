@@ -4,8 +4,10 @@
 
 use thiserror::Error;
 
+use crate::nasl::builtin::krb5::Krb5Error;
 use crate::nasl::prelude::*;
 use crate::nasl::utils::error::FnErrorKind;
+use crate::notus::NotusError;
 
 use super::KBError;
 use super::cert::CertError;
@@ -14,7 +16,6 @@ use super::find_service::FindServiceError;
 use super::host::HostError;
 use super::http::HttpError;
 use super::isotime::IsotimeError;
-#[cfg(feature = "nasl-builtin-raw-ip")]
 use super::raw_ip::RawIpError;
 use super::regex::RegexError;
 use super::snmp::SnmpError;
@@ -27,6 +28,8 @@ pub enum BuiltinError {
     Ssh(SshError),
     #[error("{0}")]
     Http(HttpError),
+    #[error("{0}")]
+    Notus(NotusError),
     #[error("{0}")]
     String(StringError),
     #[error("{0}")]
@@ -51,11 +54,12 @@ pub enum BuiltinError {
     FindService(FindServiceError),
     #[error("{0}")]
     Snmp(SnmpError),
-    #[cfg(feature = "nasl-builtin-raw-ip")]
     #[error("{0}")]
     RawIp(RawIpError),
     #[error("{0}")]
     Preference(String),
+    #[error("{0}")]
+    Krb5(Krb5Error),
 }
 
 macro_rules! builtin_error_variant (
@@ -101,6 +105,6 @@ builtin_error_variant!(CertError, Cert);
 builtin_error_variant!(SysError, Sys);
 builtin_error_variant!(FindServiceError, FindService);
 builtin_error_variant!(SnmpError, Snmp);
-
-#[cfg(feature = "nasl-builtin-raw-ip")]
+builtin_error_variant!(NotusError, Notus);
 builtin_error_variant!(RawIpError, RawIp);
+builtin_error_variant!(Krb5Error, Krb5);

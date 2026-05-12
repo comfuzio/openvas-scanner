@@ -6,21 +6,15 @@ use std::collections::{HashMap, VecDeque};
 
 use greenbone_scanner_framework::models::VTData;
 
-use super::{ExecutionPlan, RuntimeVT, VTError};
+use super::{RuntimeVT, VTError};
 
-/// Is a execution plan that only depends on script_dependencies.
-///
-/// It is based on the idea that each script that does not have any dependency will be executed
-/// at index 0.
-///
-/// When a script only has dependencies that have no dependencies themselves it will be
-/// executed at index 1.
-///
-/// When a script has dependencies that have dependencies themselves it will be executed at index 2
-/// and so on.
-///
+/// This schedule is based on the idea that each script that does not have any dependency will be
+/// executed at index 0.
+/// Scripts which depends only on scripts with index 0 are executed at index 1.
+/// Scripts which depends only on scripts with index 1 are executed at index 2.
+/// etc.
 #[derive(Default, Clone)]
-pub struct WaveExecutionPlan {
+pub(super) struct WaveExecutionPlan {
     // filename is the key to identify quickly if a dependency is within a known index
     data: VecDeque<HashMap<String, RuntimeVT>>,
     dependencies_added: bool,
@@ -66,10 +60,8 @@ impl WaveExecutionPlan {
             result
         }
     }
-}
 
-impl ExecutionPlan for WaveExecutionPlan {
-    fn append_vt(
+    pub(super) fn append_vt(
         &mut self,
         vt: RuntimeVT,
         dependencies: &HashMap<String, VTData>,
@@ -148,11 +140,10 @@ mod tests {
     use crate::scanner::Scan;
     use crate::storage::inmemory::InMemoryStorage;
 
-    use crate::scheduling::{ConcurrentVTResult, ExecutionPlaner, SchedulerStorage, Stage};
+    use crate::scheduling::{ConcurrentVTResult, Scheduler, Stage};
     use crate::storage::items::nvt::{ACT, FileName};
     use greenbone_scanner_framework::models::VTData;
 
-    use super::WaveExecutionPlan;
     use crate::storage::Dispatcher;
 
     struct OidGenerator {
@@ -292,7 +283,7 @@ mod tests {
         }
     }
 
-    fn create_results_iter<F, F2>(
+    async fn try_create_results<F, F2>(
         vt_gen: F,
         pick: F2,
     ) -> Result<Vec<ConcurrentVTResult>, super::VTError>
@@ -302,11 +293,12 @@ mod tests {
     {
         let nvts = vt_gen();
         let storage = InMemoryStorage::new();
-        nvts.clone().into_iter().for_each(|x| {
+        for x in nvts.clone().into_iter() {
             storage
                 .dispatch(FileName(x.filename.clone()), x)
+                .await
                 .expect("should store");
-        });
+        }
         let scan_vts = pick(nvts)
             .iter()
             .map(|n| VT {
@@ -319,23 +311,28 @@ mod tests {
             vts: scan_vts,
             ..Default::default()
         };
-        let results =
-            (&storage as &dyn SchedulerStorage).execution_plan::<WaveExecutionPlan>(&scan.vts);
+        let scheduler = Scheduler::new(storage);
+        let results: Result<Vec<_>, _> = scheduler
+            .execution_plan(&scan.vts)
+            .await
+            .map(|iter| iter.collect());
 
-        results.map(|x| x.collect())
+        results
     }
 
-    fn create_results<F, F2>(vt_gen: F, pick: F2) -> Vec<ConcurrentVTResult>
+    async fn create_results<F, F2>(vt_gen: F, pick: F2) -> Vec<ConcurrentVTResult>
     where
         F: Fn() -> Vec<VTData>,
         F2: Fn(Vec<VTData>) -> Vec<VTData>,
     {
-        create_results_iter(vt_gen, pick).expect("expected results")
+        try_create_results(vt_gen, pick)
+            .await
+            .expect("expected results")
     }
 
-    #[test]
+    #[tokio::test]
     #[tracing_test::traced_test]
-    fn load_dependencies() {
+    async fn load_dependencies() {
         let generator = NvtGenerator {
             discovery: 0,
             nonevasive: 15,
@@ -345,7 +342,8 @@ mod tests {
         let results = create_results(
             || generator.generate_pyramid(),
             |x| x.last().cloned().into_iter().collect(),
-        );
+        )
+        .await;
 
         let mut non_evasive_script_calls = Vec::with_capacity(4);
         for r in results
@@ -383,9 +381,9 @@ mod tests {
         );
     }
 
-    #[test]
+    #[tokio::test]
     #[tracing_test::traced_test]
-    fn phase_sort_remove_duplicates() {
+    async fn phase_sort_remove_duplicates() {
         let generator = NvtGenerator {
             discovery: 100,
             nonevasive: 100,
@@ -394,7 +392,7 @@ mod tests {
         };
         let mut vts = generator.generate();
         vts.extend(vts.clone());
-        let results = create_results(|| vts.clone(), |x| x);
+        let results = create_results(|| vts.clone(), |x| x).await;
         assert_eq!(
             results
                 .clone()
@@ -436,9 +434,10 @@ mod tests {
             generator.end
         );
     }
-    #[test]
+
+    #[tokio::test]
     #[tracing_test::traced_test]
-    fn phase_sort_stages() {
+    async fn phase_sort_stages() {
         let generator = NvtGenerator {
             discovery: 100,
             nonevasive: 100,
@@ -446,7 +445,7 @@ mod tests {
             end: 1,
         };
 
-        let results = create_results(|| generator.generate(), |x| x);
+        let results = create_results(|| generator.generate(), |x| x).await;
         assert_eq!(
             results
                 .clone()
@@ -489,9 +488,9 @@ mod tests {
         );
     }
 
-    #[test]
+    #[tokio::test]
     #[tracing_test::traced_test]
-    fn circular_dependency() {
+    async fn circular_dependency() {
         let generator = NvtGenerator {
             discovery: 3,
             nonevasive: 0,
@@ -506,13 +505,13 @@ mod tests {
             .filter(|x| x.oid == to_be_found[1..])
             .for_each(|x| x.dependencies.push(to_be_add.clone()));
         let results =
-            create_results_iter(|| vts.clone(), |x| x.last().cloned().into_iter().collect());
+            try_create_results(|| vts.clone(), |x| x.last().cloned().into_iter().collect()).await;
         assert!(results.is_err())
     }
 
-    #[test]
+    #[tokio::test]
     #[tracing_test::traced_test]
-    fn return_error_once_on_missing_dependencies() {
+    async fn return_error_once_on_missing_dependencies() {
         let generator = NvtGenerator {
             discovery: 15,
             nonevasive: 0,
@@ -524,7 +523,7 @@ mod tests {
         let _ = vts.pop();
         vts.reverse();
         let results =
-            create_results_iter(|| vts.clone(), |x| x.last().cloned().into_iter().collect());
+            try_create_results(|| vts.clone(), |x| x.last().cloned().into_iter().collect()).await;
         assert!(results.is_err())
     }
 }

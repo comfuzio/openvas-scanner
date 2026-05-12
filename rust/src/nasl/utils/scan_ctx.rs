@@ -4,42 +4,36 @@
 
 //! Defines the context used within the interpreter and utilized by the builtin functions
 
-use greenbone_scanner_framework::models::{
-    AliveTestMethods, Port, PortRange, Protocol, ScanPreference,
-};
+use async_trait::async_trait;
+use greenbone_scanner_framework::models::{AliveTestMethods, Port, Protocol, ScanPreference};
 use rand::seq::IndexedRandom;
 use tokio::sync::RwLock;
 
 use crate::nasl::builtin::{KBError, NaslSockets};
 use crate::nasl::syntax::Loader;
 use crate::nasl::{FromNaslValue, WithErrorInfo};
+use crate::notus::Notus;
 use crate::scanner::preferences::preference::{ScanPrefs, pref_is_true};
 use crate::storage::error::StorageError;
-use crate::storage::infisto::json::JsonStorage;
-use crate::storage::inmemory::InMemoryStorage;
 use crate::storage::items::kb::{self, KbKey};
 use crate::storage::items::kb::{GetKbContextKey, KbContextKey, KbItem};
-use crate::storage::items::nvt::{Feed, FeedVersion, FileName};
+use crate::storage::items::nvt::{FeedVersion, FileName};
 use crate::storage::items::nvt::{NvtField, Oid};
 use crate::storage::items::result::{ResultContextKeySingle, ResultItem};
-use crate::storage::redis::{
-    RedisAddAdvisory, RedisAddNvt, RedisGetNvt, RedisStorage, RedisWrapper,
-};
 use crate::storage::{self, ScanID};
 use crate::storage::{Dispatcher, Remover, Retriever};
 //TODO: rename
 use greenbone_scanner_framework::models::VTData;
 use std::collections::BTreeSet;
-use std::sync::MutexGuard;
+use std::sync::{Arc, MutexGuard};
 
 use super::error::ReturnBehavior;
 use super::executor::Executor;
 use super::hosts::{LOCALHOST, resolve_hostname};
 use super::{FnError, Register};
-use std::io::Write;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 #[derive(Debug, Clone)]
 pub struct VHost {
@@ -229,6 +223,7 @@ impl CtxTarget {
     }
 }
 
+#[async_trait]
 pub trait ContextStorage:
     Sync
     + Send
@@ -240,31 +235,47 @@ pub trait ContextStorage:
     // results
     + Dispatcher<ScanID, Item = ResultItem>
     + Retriever<ResultContextKeySingle, Item = ResultItem>
-    + Retriever<ScanID, Item = Vec<ResultItem>>
     + Remover<ScanID, Item = Vec<ResultItem>>
     // nvt
     + Dispatcher<FileName, Item = VTData>
     + Dispatcher<FeedVersion, Item = String>
-    + Retriever<FeedVersion, Item = String>
-    + Retriever<Feed, Item = Vec<VTData>>
     + Retriever<Oid, Item = VTData> + Retriever<FileName, Item = VTData>
 {
     /// By default the KbKey can hold multiple values. When dispatch is used on an already existing
     /// KbKey, the value is appended to the existing list. This function is used to replace the
     /// existing entry with the new one.
-    fn dispatch_replace(&self, key: KbContextKey, item: KbItem) -> Result<(), StorageError> {
-        self.remove(&key)?;
-        self.dispatch(key, item)
+    async fn dispatch_replace(&self, key: KbContextKey, item: KbItem) -> Result<(), StorageError> {
+        self.remove(&key).await?;
+        self.dispatch(key, item).await
     }
 
 }
-impl ContextStorage for InMemoryStorage {}
-impl<T: Write + Send> ContextStorage for JsonStorage<T> {}
-impl<T> ContextStorage for RedisStorage<T> where
-    T: RedisWrapper + RedisAddNvt + RedisAddAdvisory + RedisGetNvt + Send
+
+impl<T> ContextStorage for T where
+    T: Sync
+        + Send
+        // kb
+        + Dispatcher<KbContextKey, Item = KbItem>
+        + Retriever<KbContextKey, Item = Vec<KbItem>>
+        + Retriever<GetKbContextKey, Item = Vec<(String, Vec<KbItem>)>>
+        + Remover<KbContextKey, Item = Vec<KbItem>>
+        // results
+        + Dispatcher<ScanID, Item = ResultItem>
+        + Retriever<ResultContextKeySingle, Item = ResultItem>
+        + Remover<ScanID, Item = Vec<ResultItem>>
+        // nvt
+        + Dispatcher<FileName, Item = VTData>
+        + Dispatcher<FeedVersion, Item = String>
+        + Retriever<Oid, Item = VTData>
+        + Retriever<FileName, Item = VTData>
 {
 }
-impl<T> ContextStorage for Arc<T> where T: ContextStorage {}
+
+#[derive(Clone)]
+pub enum NotusCtx {
+    Direct(Arc<Mutex<Notus>>),
+    Address(SocketAddr),
+}
 
 /// NASL execution context.
 pub struct ScanCtx<'a> {
@@ -287,6 +298,8 @@ pub struct ScanCtx<'a> {
     pub scan_preferences: ScanPrefs,
     /// Alive test methods
     alive_test_methods: Vec<AliveTestMethods>,
+    /// Notus
+    pub notus: Option<NotusCtx>,
 }
 
 impl<'a> ScanCtx<'a> {
@@ -300,6 +313,7 @@ impl<'a> ScanCtx<'a> {
         executor: &'a Executor,
         scan_preferences: ScanPrefs,
         alive_test_methods: Vec<AliveTestMethods>,
+        notus: Option<NotusCtx>,
     ) -> Self {
         let mut sockets = NaslSockets::default();
         sockets.with_recv_timeout(scan_preferences.get_preference_int("checks_read_timeout"));
@@ -315,6 +329,7 @@ impl<'a> ScanCtx<'a> {
             sockets: RwLock::new(sockets),
             scan_preferences,
             alive_test_methods,
+            notus,
         }
     }
 
@@ -366,12 +381,8 @@ impl<'a> ScanCtx<'a> {
         self.target.add_hostname(hostname, source);
     }
 
-    fn port_range(&self) -> PortRange {
-        // TODO Get this from the scan prefs
-        PortRange {
-            start: 0,
-            end: None,
-        }
+    fn configured_tcp_ports(&self) -> Vec<u16> {
+        self.target.ports_tcp.iter().cloned().collect()
     }
 
     /// Get the storage
@@ -401,9 +412,10 @@ impl<'a> ScanCtx<'a> {
         }
     }
 
-    fn dispatch_nvt(&self, nvt: VTData) {
+    async fn dispatch_nvt(&self, nvt: VTData) {
         self.storage
             .dispatch(FileName(self.filename.to_string_lossy().to_string()), nvt)
+            .await
             .unwrap();
     }
 
@@ -428,42 +440,52 @@ impl<'a> ScanCtx<'a> {
         KbContextKey(
             (
                 self.scan.clone(),
-                storage::Target(self.target.original_target_str().to_string()),
+                storage::Target(self.target.ip_addr().to_string()),
             ),
             key,
         )
     }
 
-    pub fn set_kb_item(&self, key: KbKey, value: KbItem) -> Result<(), FnError> {
-        self.storage.dispatch(self.kb_key(key), value)?;
+    pub async fn set_kb_item(&self, key: KbKey, value: KbItem) -> Result<(), FnError> {
+        self.storage.dispatch(self.kb_key(key), value).await?;
         Ok(())
     }
 
-    pub fn get_kb_item(&self, key: &KbKey) -> Result<Vec<KbItem>, FnError> {
-        let result = self
+    pub async fn get_kb_item(&self, key: &KbKey) -> Result<Vec<KbItem>, FnError> {
+        let result: Vec<KbItem> = self
             .storage
-            .retrieve(&self.kb_key(key.clone()))?
+            .retrieve(&self.kb_key(key.clone()))
+            .await?
             .unwrap_or_default();
         Ok(result)
     }
 
-    fn get_kb_items_with_keys(&self, key: &KbKey) -> Result<Vec<(String, Vec<KbItem>)>, FnError> {
+    async fn get_kb_items_with_keys(
+        &self,
+        key: &KbKey,
+    ) -> Result<Vec<(String, Vec<KbItem>)>, FnError> {
         let result = self
             .storage
             .retrieve(&GetKbContextKey(
                 (
                     self.scan.clone(),
-                    storage::Target(self.target.original_target_str().into()),
+                    storage::Target(self.target.ip_addr().to_string()),
                 ),
                 key.clone(),
-            ))?
+            ))
+            .await?
             .unwrap_or_default();
         Ok(result)
     }
 
-    pub fn set_single_kb_item<T: Into<KbItem>>(&self, key: KbKey, value: T) -> Result<(), FnError> {
+    pub async fn set_single_kb_item<T: Into<KbItem>>(
+        &self,
+        key: KbKey,
+        value: T,
+    ) -> Result<(), FnError> {
         self.storage
-            .dispatch_replace(self.kb_key(key), value.into())?;
+            .dispatch_replace(self.kb_key(key), value.into())
+            .await?;
         Ok(())
     }
 
@@ -473,7 +495,7 @@ impl<'a> ScanCtx<'a> {
     /// This function automatically converts the item
     /// to a specific type via its `FromNaslValue` impl
     /// and returns the appropriate error if necessary.
-    pub fn get_single_kb_item<T: for<'b> FromNaslValue<'b>>(
+    pub async fn get_single_kb_item<T: for<'b> FromNaslValue<'b>>(
         &self,
         key: &KbKey,
     ) -> Result<T, FnError> {
@@ -482,12 +504,13 @@ impl<'a> ScanCtx<'a> {
         // value, since this is most likely an error in the feed.
         let val = self
             .get_single_kb_item_inner(key)
+            .await
             .map_err(|e| e.with(ReturnBehavior::ExitScript))?;
         T::from_nasl_value(&val.into())
     }
 
-    fn get_single_kb_item_inner(&self, key: &KbKey) -> Result<KbItem, FnError> {
-        let result = self.storage().retrieve(&self.kb_key(key.clone()))?;
+    async fn get_single_kb_item_inner(&self, key: &KbKey) -> Result<KbItem, FnError> {
+        let result = self.storage().retrieve(&self.kb_key(key.clone())).await?;
         let item = result.ok_or_else(|| KBError::ItemNotFound(key.to_string()))?;
 
         match item.len() {
@@ -496,16 +519,19 @@ impl<'a> ScanCtx<'a> {
             _ => Err(KBError::MultipleItemsFound(key.to_string()).into()),
         }
     }
+
     /// Sets the state of a port
-    pub fn set_port_transport(&self, port: u16, transport: usize) -> Result<(), FnError> {
+    pub async fn set_port_transport(&self, port: u16, transport: usize) -> Result<(), FnError> {
         self.set_single_kb_item(
             KbKey::Transport(kb::Transport::Tcp(port.to_string())),
             KbItem::Number(transport as i64),
         )
+        .await
     }
 
-    pub fn get_port_transport(&self, port: u16) -> Option<i64> {
+    pub async fn get_port_transport(&self, port: u16) -> Option<i64> {
         self.get_single_kb_item_inner(&KbKey::Transport(kb::Transport::Tcp(port.to_string())))
+            .await
             .ok()
             .and_then(|item| match item {
                 KbItem::Number(n) => Some(n),
@@ -514,9 +540,10 @@ impl<'a> ScanCtx<'a> {
     }
 
     /// Looks up open TCP ports from the knowledge base
-    pub fn get_open_tcp_ports(&self) -> Result<Vec<u16>, FnError> {
-        let open_ports =
-            self.get_kb_items_with_keys(&KbKey::Port(kb::Port::Tcp("*".to_string())))?;
+    pub async fn get_open_tcp_ports(&self) -> Result<Vec<u16>, FnError> {
+        let open_ports = self
+            .get_kb_items_with_keys(&KbKey::Port(kb::Port::Tcp("*".to_string())))
+            .await?;
 
         let port_numbers: Vec<u16> = open_ports
             .iter()
@@ -528,9 +555,9 @@ impl<'a> ScanCtx<'a> {
             })
             .collect();
 
-        // If no ports found in KB, fall back to context port range
+        // If no ports found in KB, fall back to the ports configured in the scan
         if port_numbers.is_empty() {
-            Ok(self.port_range().into_iter().collect())
+            Ok(self.configured_tcp_ports())
         } else {
             Ok(port_numbers)
         }
@@ -540,10 +567,10 @@ impl<'a> ScanCtx<'a> {
     /// we might get bitten by OSes doing active SYN flood
     /// countermeasures. Also, avoid returning 80 and 21 as
     /// open ports, as many transparent proxies are acting for these...
-    pub fn get_random_open_tcp_port(&self) -> Result<u16, FnError> {
+    pub async fn get_random_open_tcp_port(&self) -> Result<u16, FnError> {
         let mut open21 = false;
         let mut open80 = false;
-        let all_ports = self.get_open_tcp_ports()?;
+        let all_ports = self.get_open_tcp_ports().await?;
         let ports: Vec<u16> = all_ports
             .iter()
             .filter_map(|&port| {
@@ -576,25 +603,33 @@ impl<'a> ScanCtx<'a> {
         pref_is_true(prefs, key)
     }
 
-    pub fn get_port_state(&self, port: u16, protocol: Protocol) -> Result<bool, FnError> {
+    pub async fn get_port_state(&self, port: u16, protocol: Protocol) -> Result<bool, FnError> {
         match protocol {
             Protocol::TCP => {
                 if !self.target.ports_tcp.contains(&port)
-                    || self.get_kb_item(&KbKey::Host(kb::Host::Tcp))?.is_empty()
+                    || self
+                        .get_kb_item(&KbKey::Host(kb::Host::Tcp))
+                        .await?
+                        .is_empty()
                 {
                     return Ok(!self.get_preference_bool("unscanned_closed").unwrap_or(true));
                 }
                 self.get_single_kb_item(&KbKey::Port(kb::Port::Tcp(port.to_string())))
+                    .await
             }
             Protocol::UDP => {
                 if !self.target.ports_udp.contains(&port)
-                    || self.get_kb_item(&KbKey::Host(kb::Host::Udp))?.is_empty()
+                    || self
+                        .get_kb_item(&KbKey::Host(kb::Host::Udp))
+                        .await?
+                        .is_empty()
                 {
                     return Ok(!self
                         .get_preference_bool("unscanned_closed_udp")
                         .unwrap_or(true));
                 }
                 self.get_single_kb_item(&KbKey::Port(kb::Port::Udp(port.to_string())))
+                    .await
             }
         }
     }
@@ -618,7 +653,11 @@ impl Drop for ScanCtx<'_> {
     fn drop(&mut self) {
         let mut nvt = self.nvt.lock().unwrap();
         if let Some(nvt) = nvt.take() {
-            self.dispatch_nvt(nvt);
+            // TODO: This might very well not work.
+            // Do we really need this Drop impl anyways?
+            futures::executor::block_on(async {
+                self.dispatch_nvt(nvt).await;
+            });
         }
     }
 }
@@ -649,6 +688,7 @@ pub struct ScanCtxBuilder<'a, P: AsRef<Path>> {
     pub filename: P,
     pub scan_preferences: ScanPrefs,
     pub alive_test_methods: Vec<AliveTestMethods>,
+    pub notus: Option<NotusCtx>,
 }
 
 impl<'a, P: AsRef<Path>> ScanCtxBuilder<'a, P> {
@@ -663,6 +703,7 @@ impl<'a, P: AsRef<Path>> ScanCtxBuilder<'a, P> {
             self.executor,
             self.scan_preferences,
             self.alive_test_methods,
+            self.notus,
         )
     }
 }

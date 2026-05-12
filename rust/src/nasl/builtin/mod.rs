@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: GPL-2.0-or-later WITH x11vnc-openssl-exception
 
-#![doc = include_str!("README.md")]
+//! Contains builtin functions (i.e. the standard library of NASL).
 
 mod array;
 mod cert;
@@ -14,15 +14,15 @@ mod host;
 mod http;
 mod isotime;
 mod knowledge_base;
+mod krb5;
 pub mod misc;
 pub mod network;
-mod snmp;
-
+mod notus;
 mod preferences;
-#[cfg(feature = "nasl-builtin-raw-ip")]
 pub mod raw_ip;
 mod regex;
 mod report_functions;
+mod snmp;
 mod ssh;
 mod string;
 mod sys;
@@ -64,11 +64,11 @@ pub fn nasl_std_functions() -> Executor {
         .add_set(find_service::FindService)
         .add_set(wmi::Wmi)
         .add_set(snmp::Snmp)
-        .add_set(cert::NaslCerts::default());
+        .add_set(cert::NaslCerts::default())
+        .add_set(notus::NaslNotus::default());
 
-    #[cfg(feature = "nasl-builtin-raw-ip")]
+    executor.add_set(krb5::Krb5::default());
     executor.add_set(raw_ip::RawIp);
-    #[cfg(feature = "nasl-builtin-raw-ip")]
     executor.add_global_vars(raw_ip::RawIp);
     executor.add_global_vars(network::socket::SocketFns);
 

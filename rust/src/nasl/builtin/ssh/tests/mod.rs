@@ -8,7 +8,6 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use rand_core::OsRng;
 use russh::server::Config as ServerConfig;
 use russh::server::Server as _;
 
@@ -30,7 +29,7 @@ static LOCK: Lazy<Mutex<()>> = Lazy::new(Mutex::default);
 const PORT: u16 = 2223;
 
 fn default_config() -> ServerConfig {
-    let mut rng = OsRng;
+    let mut rng = rand::rng();
     ServerConfig {
         keys: vec![PrivateKey::random(&mut rng, russh::keys::Algorithm::Ed25519).unwrap()],
         inactivity_timeout: Some(std::time::Duration::from_secs(3600)),
@@ -90,7 +89,7 @@ async fn ssh_connect() {
                 ArgumentError::WrongArgument(_)
             );
             // Without a matching key algorithm, we should not be able to connect
-            #[cfg(not(feature = "nasl-builtin-libssh"))]
+            #[cfg(feature = "native-rust-ssh")]
             check_err_matches!(
                 t,
                 format!(r#"id = ssh_connect(port:{PORT}, keytype: "ssh-rsa");"#),
@@ -143,7 +142,7 @@ async fn ssh_userauth() {
 // the bug does not appear when connected to an openssh
 // server. To fix this, I'd need to understand the
 // russh server code in more detail.
-#[cfg_attr(feature = "nasl-builtin-libssh", ignore)]
+#[cfg_attr(not(feature = "native-rust-ssh"), ignore)]
 async fn ssh_request_exec() {
     run_test(
         |t| {

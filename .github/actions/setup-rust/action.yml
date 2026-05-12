@@ -11,10 +11,13 @@ runs:
           ~/.cargo/registry/cache/
           ~/.cargo/git/db/
           rust/target/
+          rust/crates/rpmdb-rs/testdata/
         key: amd64-cargo
     - run: sudo apt update || true
       shell: bash
     - run: sudo apt-get install -y libpcap-dev libclang-dev libsnmp-dev patchelf 
+      shell: bash
+    - run: sudo apt-get install -y capnproto # required for sequoia-ipc
       shell: bash
     - run: rustup update stable && rustup default stable || rustup default stable
       shell: bash

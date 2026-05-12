@@ -1,7 +1,6 @@
 use std::{env, path::PathBuf, str::FromStr, time::Duration};
 
 use serde::{Deserialize, Serialize};
-use sqlx::sqlite::SqliteSynchronous;
 
 #[derive(Default, Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub enum DBLocation {
@@ -151,7 +150,7 @@ impl SqliteConfiguration {
         use sqlx::{
             Sqlite,
             pool::PoolOptions,
-            sqlite::{SqliteConnectOptions, SqliteJournalMode},
+            sqlite::{SqliteConnectOptions, SqliteJournalMode, SqliteSynchronous},
         };
         if let DBLocation::File(path) = &self.location
             && !path.exists()
@@ -217,7 +216,7 @@ impl Default for Image {
         Self {
             extract_to: Default::default(),
             max_scanning: 10,
-            batch_size: 3,
+            batch_size: 2,
             scanning_retries: 3,
             retry_timeout: Duration::from_secs(1),
         }
@@ -242,7 +241,7 @@ impl Default for Config {
         Self {
             database: Default::default(),
             image: Default::default(),
-            max_scans: 1,
+            max_scans: 5,
         }
     }
 }

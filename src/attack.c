@@ -40,6 +40,7 @@
 #include <gvm/base/prefs.h>            /* for prefs_get() */
 #include <gvm/boreas/alivedetection.h> /* for start_alive_detection() */
 #include <gvm/boreas/boreas_io.h>      /* for get_host_from_queue() */
+#include <gvm/boreas/cli.h>            /* for ipv6 host discovery */
 #include <gvm/util/mqtt.h>
 #include <gvm/util/nvticache.h> /* for nvticache_t */
 #include <pthread.h>
@@ -160,7 +161,7 @@ set_scan_status (char *status)
  * which is vulnerability tested. Launched is the number of plguins(VTs) which
  * got already started. Total is the total number of plugins which will be
  * started for the current host. But here we use the format "current_host/0/-1"
- * for implicit singalling that the host is dead.
+ * for implicit signalling that the host is dead.
  *
  * @param main_kb Kb to use
  * @param ip_str str representation of host ip
@@ -419,9 +420,8 @@ read_ipc (struct attack_start_args *args, struct ipc_context *ctx)
 
   while ((results = ipc_retrieve (ctx, IPC_MAIN)) != NULL)
     {
-      int len = 0;
-      int pos = 0;
-      for (int j = 0; results[j] != '\0'; j++)
+      size_t len, pos = 0;
+      for (size_t j = 0; results[j] != '\0'; j++)
         if (results[j] == '}')
           {
             gchar *message = NULL;
@@ -429,7 +429,6 @@ read_ipc (struct attack_start_args *args, struct ipc_context *ctx)
             message = g_malloc0 (sizeof (gchar) * (len + 1));
             memcpy (message, &results[pos], len);
             pos = j + 1;
-            len = 0;
             ipc_msg_flag |= process_ipc_data (args, message);
             g_free (message);
           }
@@ -1199,7 +1198,26 @@ attack_network (struct scan_globals *globals)
       return error;
     }
   /* Init and check Target List */
-  hostlist = prefs_get ("TARGET");
+#ifdef FEATURE_HOST_DISCOVERY_IPV6
+  alive_test_t alive_test;
+  const char *target_aux = prefs_get ("TARGET");
+  char *host_found = "";
+
+  get_alive_test_methods (&alive_test);
+  if (alive_test == 32)
+    {
+      int print_results = 0;
+      run_cli_for_ipv6_network (target_aux, &host_found, print_results);
+      hostlist = host_found;
+      // Consider alive the found hosts, to avoid double check later
+      prefs_set("ALIVE_TEST", "8");
+    }
+  else
+#endif /* FEATURE_HOST_DISCOVERY_IPV6 */
+    {
+      hostlist = prefs_get ("TARGET");
+    }
+
   if (hostlist == NULL)
     {
       error = -1;

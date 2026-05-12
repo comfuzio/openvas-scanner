@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use crate::nasl::interpreter::{ForkingInterpreter, InterpreterError};
 use crate::nasl::syntax::Loader;
 use crate::nasl::utils::lookup_keys::SCRIPT_PARAMS;
-use crate::nasl::utils::scan_ctx::{ContextStorage, Ports, Target};
+use crate::nasl::utils::scan_ctx::{ContextStorage, NotusCtx, Ports, Target};
 use crate::nasl::utils::{Executor, Register};
 use crate::scheduling::Stage;
 use crate::storage::error::StorageError;
@@ -15,7 +15,7 @@ use crate::storage::items::kb::{self, KbContext, KbContextKey, KbItem, KbKey};
 use futures::StreamExt;
 use greenbone_scanner_framework::models::VTData;
 use greenbone_scanner_framework::models::{AliveTestMethods, Parameter, Protocol};
-use tracing::{error_span, trace, warn};
+use tracing::{trace, warn};
 
 use crate::nasl::prelude::*;
 
@@ -37,6 +37,7 @@ pub struct VTRunner<'a, S> {
     scan_id: String,
     scan_preferences: &'a ScanPrefs,
     alive_test_methods: &'a Vec<AliveTestMethods>,
+    notus: &'a Option<NotusCtx>,
 }
 
 impl<'a, S> VTRunner<'a, S>
@@ -56,6 +57,7 @@ where
         scan_id: String,
         scan_preferences: &'a ScanPrefs,
         alive_test_methods: &'a Vec<AliveTestMethods>,
+        notus: &'a Option<NotusCtx>,
     ) -> Result<ScriptResult, ExecuteError> {
         let s = Self {
             storage,
@@ -69,6 +71,7 @@ where
             scan_id,
             scan_preferences,
             alive_test_methods,
+            notus,
         };
         s.execute().await
     }
@@ -85,7 +88,7 @@ where
         Ok(())
     }
 
-    fn check_key<A, B, C>(
+    async fn check_key<A, B, C>(
         &self,
         key: &KbContextKey,
         result_none: A,
@@ -97,8 +100,7 @@ where
         B: Fn(Vec<KbItem>) -> Option<ScriptResultKind>,
         C: Fn(StorageError) -> Option<ScriptResultKind>,
     {
-        let _span = error_span!("kb_item", %key).entered();
-        let result = match self.storage.retrieve(key) {
+        let result = match self.storage.retrieve(key).await {
             Ok(x) => {
                 if let Some(x) = x {
                     result_some(x)
@@ -118,45 +120,39 @@ where
         }
     }
 
-    fn check_keys(&self, vt: &VTData) -> Result<(), ScriptResultKind> {
+    async fn check_keys(&self, vt: &VTData) -> Result<(), ScriptResultKind> {
         let key = self.generate_key();
-        let check_required_key = |k: &str| {
+        for k in &vt.required_keys {
             self.check_key(
                 &KbContextKey(key.clone(), k.into()),
                 || Some(ScriptResultKind::MissingRequiredKey(k.into())),
                 |_| None,
                 |_| Some(ScriptResultKind::MissingRequiredKey(k.into())),
             )
-        };
-        for k in &vt.required_keys {
-            check_required_key(k)?
+            .await?
         }
 
-        let check_mandatory_key = |k: &str| {
+        for k in &vt.mandatory_keys {
             self.check_key(
                 &KbContextKey(key.clone(), k.into()),
                 || Some(ScriptResultKind::MissingMandatoryKey(k.into())),
                 |_| None,
                 |_| Some(ScriptResultKind::MissingMandatoryKey(k.into())),
             )
-        };
-        for k in &vt.mandatory_keys {
-            check_mandatory_key(k)?
+            .await?
         }
 
-        let check_exclude_key = |k: &str| {
+        for k in &vt.excluded_keys {
             self.check_key(
                 &KbContextKey(key.clone(), k.into()),
                 || None,
                 |_| Some(ScriptResultKind::ContainsExcludedKey(k.into())),
                 |_| None,
             )
-        };
-        for k in &vt.excluded_keys {
-            check_exclude_key(k)?
+            .await?
         }
 
-        let check_port = |pt: Protocol, port: &str| {
+        let check_port = async |pt: Protocol, port: &str| {
             let kbk = match pt {
                 Protocol::UDP => KbKey::Port(kb::Port::Udp(port.to_string())),
                 Protocol::TCP => KbKey::Port(kb::Port::Tcp(port.to_string())),
@@ -173,12 +169,13 @@ where
                 },
                 |_| Some(ScriptResultKind::MissingPort(pt, port.to_string())),
             )
+            .await
         };
         for k in &vt.required_ports {
-            check_port(Protocol::TCP, k)?
+            check_port(Protocol::TCP, k).await?
         }
         for k in &vt.required_udp_ports {
-            check_port(Protocol::UDP, k)?
+            check_port(Protocol::UDP, k).await?
         }
 
         Ok(())
@@ -198,7 +195,7 @@ where
         code: Code,
         register: Register,
     ) -> ScriptResultKind {
-        if let Err(e) = self.check_keys(self.vt) {
+        if let Err(e) = self.check_keys(self.vt).await {
             return e;
         }
         let context = ScanCtxBuilder {
@@ -211,6 +208,7 @@ where
             executor: self.executor,
             scan_preferences: self.scan_preferences.clone(),
             alive_test_methods: self.alive_test_methods.to_vec(),
+            notus: self.notus.clone(),
         }
         .build();
         context.set_nvt(self.vt.clone());

@@ -44,7 +44,7 @@ everything needed for scanning. Currently it uses the openvas-scanner as scan en
 
 ## Docker, [Greenbone Community Containers](https://greenbone.github.io/docs/latest/22.4/container/)
 
-If you want to use the docker files provided in this repository you can pull them from the [Greenbone registry](registry.community.greenbone.net/community/openvas-scanner:stable). You can also locally build them using:
+If you want to use the docker files provided in this repository you can pull them from the [Greenbone registry](ghcr.io/greenbone/openvas-scanner:stable). You can also locally build them using:
 ```
 docker build -t <image-name> -f .docker/prod.Dockerfile .
 ```
@@ -75,6 +75,7 @@ Your contributions are highly appreciated. Please [create a pull
 request](https://github.com/greenbone/openvas-scanner/pulls) on GitHub.
 Remember to commit the contribution agreement as explained in [RELICENSING](https://github.com/greenbone/openvas-scanner/tree/main/RELICENSE) folder with your first PR.
 Bigger changes should be discussed with the development team via the [issues section at GitHub](https://github.com/greenbone/openvas-scanner/issues) first.
+Since the project has an autolabel for releases (patch, minor and major), commit messages should follow the rules explained in [conventional commit rules](https://github.com/greenbone/openvas-scanner/tree/main/CONVENTIONAL-COMMITS.md) document.
 
 ## License
 

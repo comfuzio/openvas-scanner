@@ -29,6 +29,9 @@ pub struct Feed {
         serialize_with = "scannerlib::utils::duration::serialize"
     )]
     pub check_interval: Duration,
+
+    // TODO: rename to feed_integrity_check and tell serde to accept:
+    // signature_check as weel as feed_integrity_check.
     pub signature_check: bool,
 }
 
@@ -36,6 +39,7 @@ pub struct Feed {
 pub struct Notus {
     pub products_path: PathBuf,
     pub advisories_path: PathBuf,
+    pub address: Option<SocketAddr>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -129,7 +133,7 @@ impl Default for Feed {
         Feed {
             path: PathBuf::from("/var/lib/openvas/plugins"),
             check_interval: Duration::from_secs(3600),
-            signature_check: false,
+            signature_check: true,
         }
     }
 }
@@ -139,6 +143,7 @@ impl Default for Notus {
         Notus {
             products_path: PathBuf::from("/var/lib/notus/products"),
             advisories_path: PathBuf::from("/var/lib/notus/advisories"),
+            address: None,
         }
     }
 }
@@ -327,6 +332,8 @@ pub struct Config {
     pub scanner: Scanner,
     #[serde(alias = "container-image-scanner")]
     pub container_image_scanner: crate::container_image_scanner::Config,
+    #[serde(skip)]
+    pub version: bool,
 }
 
 impl Display for Config {
@@ -412,9 +419,8 @@ impl Config {
                     .long("feed-signature-check")
                     .short('x')
                     .action(ArgAction::SetTrue)
-                    .help("Enable feed signature check"),
+                    .help("Deprecated. To enable or disable feed signature use the configuration."),
             )
-
             .arg(
                 clap::Arg::new("feed-check-interval")
                     .env("FEED_CHECK_INTERVAL")
@@ -437,6 +443,14 @@ impl Config {
                     .value_parser(clap::builder::PathBufValueParser::new())
                     .action(ArgAction::Set)
                     .help("Path containing the Notus products directory"))
+            .arg(
+                clap::Arg::new("notus-address")
+                    .env("NOTUS_ADDRESS")
+                    .long("notus-address")
+                    .value_name("IP:PORT")
+                    .value_parser(clap::value_parser!(SocketAddr))
+                    .action(ArgAction::Set)
+                    .help("the address to reach notus on"))
             .arg(
                 clap::Arg::new("redis-url")
                     .long("redis-url")
@@ -594,6 +608,12 @@ impl Config {
                     .help("Level of log messages to be shown. TRACE > DEBUG > INFO > WARN > ERROR"),
             )
             .arg(
+                clap::Arg::new("version")
+                    .long("version")
+                    .action(ArgAction::SetTrue)
+                    .help("Show openvasd version and exit."),
+            )
+            .arg(
                 clap::Arg::new("mode")
                     .env("OPENVASD_MODE")
                     .long("mode")
@@ -658,6 +678,9 @@ impl Config {
         if let Some(path) = cmds.get_one::<PathBuf>("notus-advisories") {
             config.notus.advisories_path.clone_from(path);
         }
+        if let Some(address) = cmds.get_one::<SocketAddr>("notus-address") {
+            config.notus.address = Some(*address);
+        }
         if let Some(_path) = cmds.get_one::<String>("redis-url") {
             // is actually ignored as on scanner openvas the redis-url of openvas is used
         }
@@ -672,6 +695,9 @@ impl Config {
         }
         if let Some(enable) = cmds.get_one::<bool>("enable-get-scans") {
             config.endpoints.enable_get_scans = *enable;
+        }
+        if let Some(version) = cmds.get_one::<bool>("version") {
+            config.version = *version;
         }
         if let Some(enable) = cmds.get_one::<bool>("enable-get-performance") {
             config.endpoints.enable_get_performance = Some(*enable);

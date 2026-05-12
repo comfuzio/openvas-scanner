@@ -3,10 +3,7 @@ use std::{
     net::SocketAddr,
     path::PathBuf,
     pin::Pin,
-    sync::{
-        Arc, RwLock,
-        atomic::{AtomicUsize, Ordering},
-    },
+    sync::{Arc, RwLock, atomic::AtomicUsize},
 };
 
 use delete_scans_id::{DeleteScansId, DeleteScansIdHandler};
@@ -46,11 +43,16 @@ use get_health::{GetHealthAliveHandler, GetHealthReadyHandler, GetHealthStartedH
 pub mod models;
 mod post_scans;
 use models::FeedState;
+use once_cell::sync::Lazy;
 pub use post_scans::{PostScans, PostScansError};
 mod post_scans_id;
 mod tls;
 use post_scans::PostScansHandler;
 use post_scans_id::{PostScansId, PostScansIdHandler};
+
+use futures::stream::StreamExt;
+use signal_hook::consts::signal::*;
+use signal_hook_tokio::Signals;
 use tokio::net::TcpListener;
 
 pub trait ExternalError: core::error::Error + Send + Sync + 'static {}
@@ -68,6 +70,7 @@ pub mod prelude {
         GetScansIdResultsId, GetScansIdStatus, GetScansPreferences, MapScanID, PostScans,
         PostScansError, StreamResult,
         delete_scans_id::{DeleteScansIDError, DeleteScansId},
+        entry::Prefixed,
         models,
         post_scans_id::{PostScansIDError, PostScansId},
     };
@@ -374,8 +377,73 @@ impl RuntimeBuilder<runtime_builder_states::DeleteScanIDSet> {
     }
 }
 
+async fn next_exit_signal(signals: &mut Signals) -> Option<i32> {
+    match signals.next().await {
+        Some(SIGHUP) => {
+            tracing::info!("Ignoring SIGHUP signal.");
+            None
+        }
+        Some(signal @ (SIGTERM | SIGINT | SIGQUIT)) => {
+            tracing::info!(signal, "Exit based on signal.");
+            Some(128 + signal)
+        }
+        Some(_) => unreachable!(),
+        None => {
+            tracing::warn!("Signal stream ended unexpectedly.");
+            Some(0)
+        }
+    }
+}
+
+static REQUEST_COUNTER: Lazy<Arc<AtomicUsize>> = Lazy::new(Default::default);
+
+fn make_service(
+    scanner: Arc<Scanner>,
+    handlers: Arc<RequestHandlers>,
+    client_id: ClientIdentifier,
+    max_connections: usize,
+) -> entry::EntryPoint {
+    entry::EntryPoint::new(
+        scanner,
+        Arc::new(client_id),
+        handlers,
+        max_connections,
+        REQUEST_COUNTER.clone(),
+    )
+}
+
+async fn run_accept_loop<F, Fut>(
+    incoming: TcpListener,
+    mut signals: Signals,
+    on_accept: F,
+) -> Result<i32, Box<dyn std::error::Error + Send + Sync>>
+where
+    F: Fn(tokio::net::TcpStream) -> Fut + Send + Sync + Clone + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    loop {
+        tokio::select! {
+            maybe_exit = next_exit_signal(&mut signals) => {
+                if let Some(code) = maybe_exit {
+                    return Ok(code);
+                }
+            }
+
+            accept_result = incoming.accept() => {
+                let (tcp_stream, _remote_addr) = accept_result?;
+                let f = on_accept.clone();
+                tokio::spawn(async move {
+                    f(tcp_stream).await;
+                });
+            }
+        }
+    }
+}
+
 impl RuntimeBuilder<runtime_builder_states::End> {
-    pub async fn run_blocking(self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn run_blocking(self) -> Result<i32, Box<dyn std::error::Error + Send + Sync>> {
+        let signals = Signals::new([SIGHUP, SIGTERM, SIGINT, SIGQUIT])?;
+
         let scanner = Arc::new(self.build_scanner());
         let tls_config = match &self.tls {
             Some(x) => Some(tls::tls_config(x)?),
@@ -384,79 +452,82 @@ impl RuntimeBuilder<runtime_builder_states::End> {
 
         let incoming = TcpListener::bind(&self.listener_address).await?;
         let handlers = Arc::new(self.handlers);
-        let connection_counter = Arc::new(AtomicUsize::new(0));
+
         let max_connections = self.max_concurrent_connections;
 
         if let Some(tls_config) = tls_config {
-            use hyper::server::conn::http2::Builder;
             tracing::info!("listening on https://{}", self.listener_address);
+
+            use hyper::server::conn::http2::Builder;
 
             let config = Arc::new(tls_config.config);
             let tls_acceptor = tokio_rustls::TlsAcceptor::from(config);
+            let identifier = tls_config.client_identifier.clone();
 
-            loop {
-                let (tcp_stream, _remote_addr) = incoming.accept().await?;
-                let tls_acceptor = tls_acceptor.clone();
-                let identifier = tls_config.client_identifier.clone();
-                let ctx = scanner.clone();
+            run_accept_loop(incoming, signals, {
+                let scanner = scanner.clone();
                 let handlers = handlers.clone();
-                let connection_counter = connection_counter.clone();
-                tokio::spawn(async move {
-                    let tls_stream = match tls_acceptor.accept(tcp_stream).await {
-                        Ok(tls_stream) => tls_stream,
-                        Err(err) => {
-                            tracing::debug!("failed to perform tls handshake: {err:#}");
-                            return;
+
+                move |tcp_stream| {
+                    let tls_acceptor = tls_acceptor.clone();
+                    let identifier = identifier.clone();
+                    let scanner = scanner.clone();
+                    let handlers = handlers.clone();
+
+                    async move {
+                        let tls_stream = match tls_acceptor.accept(tcp_stream).await {
+                            Ok(tls_stream) => tls_stream,
+                            Err(err) => {
+                                tracing::debug!("failed to perform tls handshake: {err:#}");
+                                return;
+                            }
+                        };
+
+                        let cci = retrieve_and_reset_client_identifier(identifier);
+                        let service = make_service(scanner, handlers, cci, max_connections);
+
+                        if let Err(err) = Builder::new(TokioExecutor::new())
+                            .max_concurrent_streams(20)
+                            .serve_connection(TokioIo::new(tls_stream), service)
+                            .await
+                        {
+                            tracing::debug!("failed to serve connection: {err:#}");
                         }
-                    };
-                    let cci = retrieve_and_reset_client_identifier(identifier);
-                    // count amount of requests
-                    let service = entry::EntryPoint::new(
-                        ctx,
-                        Arc::new(cci),
-                        handlers,
-                        max_connections,
-                        connection_counter.fetch_add(1, Ordering::SeqCst),
-                    );
-                    if let Err(err) = Builder::new(TokioExecutor::new())
-                        .max_concurrent_streams(20)
-                        .serve_connection(TokioIo::new(tls_stream), service)
-                        .await
-                    {
-                        tracing::debug!("failed to serve connection: {err:#}");
                     }
-                    let released = connection_counter.fetch_sub(1, Ordering::SeqCst);
-                    tracing::trace!(released, "released");
-                });
-            }
+                }
+            })
+            .await
         } else {
-            use hyper::server::conn::http1::Builder;
             tracing::info!("listening on http://{}", self.listener_address);
-            loop {
-                let (tcp_stream, _remote_addr) = incoming.accept().await?;
-                let ctx = scanner.clone();
-                let handlers = handlers.clone();
-                let connection_counter = connection_counter.clone();
-                tokio::spawn(async move {
-                    let cci = ClientIdentifier::Unknown;
-                    let service = entry::EntryPoint::new(
-                        ctx,
-                        Arc::new(cci),
-                        handlers,
-                        max_connections,
-                        connection_counter.fetch_add(1, Ordering::SeqCst),
-                    );
-                    if let Err(err) = Builder::new()
-                        .serve_connection(TokioIo::new(tcp_stream), service)
-                        .await
-                    {
-                        tracing::debug!("failed to serve connection: {err:#}");
-                    }
 
-                    let connection = connection_counter.fetch_sub(1, Ordering::SeqCst);
-                    tracing::trace!(connection, "released");
-                });
-            }
+            use hyper::server::conn::http1::Builder;
+
+            run_accept_loop(incoming, signals, {
+                let scanner = scanner.clone();
+                let handlers = handlers.clone();
+
+                move |tcp_stream| {
+                    let scanner = scanner.clone();
+                    let handlers = handlers.clone();
+
+                    async move {
+                        let service = make_service(
+                            scanner,
+                            handlers,
+                            ClientIdentifier::Unknown,
+                            max_connections,
+                        );
+
+                        if let Err(err) = Builder::new()
+                            .serve_connection(TokioIo::new(tcp_stream), service)
+                            .await
+                        {
+                            tracing::debug!("failed to serve connection: {err:#}");
+                        }
+                    }
+                }
+            })
+            .await
         }
     }
 }

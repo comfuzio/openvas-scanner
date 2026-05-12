@@ -7,6 +7,7 @@ use std::{
 
 use flate2::{Compression, write::GzEncoder};
 use tar::Builder;
+use vergen_git2::{Emitter, Git2Builder};
 
 fn create_test_layer(name: &str) -> Option<()> {
     fn ignore_error<O, E>(input: Result<O, E>) -> Option<O>
@@ -22,9 +23,9 @@ fn create_test_layer(name: &str) -> Option<()> {
         }
     }
 
-    let input_dir = format!("test-data/images/{name}");
+    let input_dir = format!("data/tests/images/{name}");
     let input_dir = Path::new(&input_dir);
-    let output = format!("test-data/layers/{name}.tar.gz");
+    let output = format!("data/tests/layers/{name}.tar.gz");
     let output_path = Path::new(&output);
 
     if !output_path.exists() {
@@ -48,7 +49,20 @@ fn create_test_binaries() {
     create_test_layer("victim");
 }
 
+fn set_version() {
+    if let Some(bv) = std::option_env!("BIN_VERSION") {
+        println!("cargo:rustc-env=VERGEN_GIT_DESCRIBE={}", bv);
+    } else if let Ok(git2) = Git2Builder::default().describe(true, false, None).build()
+        && let Ok(g) = Emitter::default().add_instructions(&git2)
+        && g.emit().is_err()
+    {
+        // fall back if emit can not generate the env variable
+        println!("cargo:rustc-env=VERGEN_GIT_DESCRIBE=unknown");
+    }
+}
+
 fn main() {
     //println!("cargo:rerun-if-changed=migrations");
     create_test_binaries();
+    set_version();
 }

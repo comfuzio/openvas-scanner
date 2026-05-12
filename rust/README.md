@@ -19,9 +19,9 @@ The implementation is split into multiple parts that are reflected in the direct
 # Requirements
 
 - rust toolchain
-
-Additionally for the features defined as experimental you need:
-
+- openssl
+- libclang
+- libnetsnmp
 - libpcap
 - openssl
 - pkg-config
@@ -36,14 +36,11 @@ To build and create the executables
 
 You have to execute
 ```
+make
 cargo build --release
 ```
 
-To enable the experimental features:
-
-```
-cargo build -F experimental --release
-```
+The `make` command builds required c libraries. For more information check [Documentation](./crates/nasl-c-lib/README.md)
 
 # Contribution
 

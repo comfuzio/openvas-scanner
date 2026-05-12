@@ -12,7 +12,7 @@ use crate::container_image_scanner::{
     Streamer,
     benchy::{self, Measured},
     image::{
-        Image,
+        Digest, Image,
         registry::{RegistryError, RegistryErrorKind},
     },
 };
@@ -30,7 +30,7 @@ impl Stream for BlobStream {
     }
 }
 
-type ArchitectureLayer = (String, Vec<String>);
+type ArchitectureLayer = (Option<Digest>, String, Digest);
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Registry {
@@ -81,6 +81,18 @@ impl ClientBuilder {
                 | docker_registry::errors::Error::Server { status } => Some(status.as_u16()),
                 _ => None,
             },
+        }
+    }
+
+    fn functional_error<T>(&self, kind: RegistryErrorKind, reason: T) -> RegistryError
+    where
+        T: std::fmt::Debug,
+    {
+        tracing::warn!(?reason, %kind, self.registry, self.scope);
+        RegistryError {
+            registry: Some(self.registry.to_owned()),
+            kind,
+            status_code: None,
         }
     }
     fn catalog_error(&self, source: docker_registry::errors::Error) -> RegistryError {
@@ -186,6 +198,70 @@ impl Client {
             .get_manifest_and_ref(name, reference)
             .await
             .map_err(|source| self.builder.manifest_error(source))
+    }
+
+    fn manifest_to_architecture(
+        &self,
+        digest: Option<String>,
+        manifest: Manifest,
+    ) -> Result<(Manifest, String, Option<Digest>), RegistryError> {
+        let digest = digest.map(Digest::from);
+        match manifest {
+            Manifest::S2(m) => {
+                let arch = m.architecture();
+                Ok((Manifest::S2(m), arch, digest))
+            }
+            Manifest::S1Signed(m) => {
+                let arch = m.architecture.clone();
+                Ok((Manifest::S1Signed(m), arch, digest))
+            }
+            Manifest::OciIndex(_) => Err(self.builder.functional_error(
+                RegistryErrorKind::Manifest,
+                "Embedded OciIndex manifest are currently not supported.",
+            )),
+            Manifest::ML(_) => Err(self.builder.functional_error(
+                RegistryErrorKind::Manifest,
+                "Embedded manifests lists are currently not supported.",
+            )),
+        }
+    }
+
+    pub async fn resolve_manifests(
+        &self,
+        name: &str,
+        reference: &str,
+    ) -> Vec<Result<(Manifest, String, Option<Digest>), RegistryError>> {
+        let og = self.get_manifest(name, reference).await;
+        match og {
+            Ok((Manifest::ML(ml), _)) => {
+                let mut results = Vec::with_capacity(ml.manifests.len());
+                for m in ml.manifests.into_iter() {
+                    match self.get_manifest(name, &m.digest).await {
+                        Ok((m, digest)) => {
+                            results.push(self.manifest_to_architecture(digest, m));
+                        }
+                        Err(error) => results.push(Err(error)),
+                    }
+                }
+                results
+            }
+            Ok((Manifest::OciIndex(oi), _)) => {
+                let mut results = Vec::with_capacity(oi.manifests.len());
+                for m in oi.manifests.into_iter() {
+                    match self.get_manifest(name, &m.digest).await {
+                        Ok((m, digest)) => {
+                            results.push(self.manifest_to_architecture(digest, m));
+                        }
+                        Err(error) => results.push(Err(error)),
+                    }
+                }
+                results
+            }
+            Ok((m, digest)) => {
+                vec![self.manifest_to_architecture(digest, m)]
+            }
+            Err(err) => vec![Err(err)],
+        }
     }
 
     pub async fn get_blob(&self, name: &str, digest: &str) -> Result<Vec<u8>, RegistryError> {
@@ -340,14 +416,7 @@ impl Registry {
     async fn fetch_digest_layer(
         &self,
         image: &Image,
-    ) -> Result<
-        (
-            Option<String>,
-            Client,
-            Vec<Result<ArchitectureLayer, RegistryError>>,
-        ),
-        RegistryError,
-    > {
+    ) -> Result<(Client, Vec<Result<ArchitectureLayer, RegistryError>>), RegistryError> {
         let repository = match image.image() {
             None => {
                 return Err(RegistryError::no_repository());
@@ -362,30 +431,19 @@ impl Registry {
         let registry = &image.registry;
         let client = self.pull_client(registry, repository).await?;
 
-        let (manifest, digest) = client.get_manifest(repository, tag).await?;
-        let architectures = manifest.architectures().unwrap_or_default();
-        tracing::trace!(?architectures, ?image, "Supported architectures");
-        Ok((
-            digest,
-            client,
-            architectures
-                .iter()
-                .map(|x| {
-                    manifest
-                        .layers_digests(Some(x))
-                        .map(|l| (x.to_owned(), l))
-                        .map_err(|x| {
-                            let kind = RegistryErrorKind::Manifest;
-                            tracing::warn!(%kind, registry, source=%x);
-                            RegistryError {
-                                registry: Some(registry.to_owned()),
-                                kind,
-                                status_code: None,
-                            }
-                        })
-                })
+        let manifests = client.resolve_manifests(repository, tag).await;
+        let result = manifests.into_iter().flat_map(|r| match r {
+            Ok((m, arch, image_digest)) => m
+                .layers_digests(Some(&arch))
+                .unwrap_or_default()
+                .into_iter()
+                .map(|l| Ok((image_digest.clone(), arch.clone(), l.into())))
                 .collect(),
-        ))
+            Err(error) => vec![Err(error)],
+        });
+
+        tracing::trace!(?result, ?image, "found layer");
+        Ok((client, result.collect()))
     }
 }
 
@@ -410,8 +468,7 @@ impl super::Registry for Registry {
     fn resolve_image(
         &self,
         image: super::Image,
-    ) -> Pin<Box<dyn Future<Output = Vec<Result<super::Image, RegistryError>>> + Send + Sync + '_>>
-    {
+    ) -> Pin<Box<dyn Future<Output = Vec<Result<super::Image, RegistryError>>> + Send + '_>> {
         Box::pin(async move {
             match image {
                 Image {
@@ -442,7 +499,7 @@ impl super::Registry for Registry {
             };
             tracing::trace!(image = %image, "Downloading digest");
 
-            let (image_digest, client, og) = match that.fetch_digest_layer(&image).await {
+            let (client, og) = match that.fetch_digest_layer(&image).await {
                 Ok(x) => x,
                 Err(e) => {
                     send_log(e).await;
@@ -450,12 +507,27 @@ impl super::Registry for Registry {
                 }
             };
 
-            let mut digest = Vec::with_capacity(og.len() * 2);
-            for r in og {
+            for (i, r) in og.into_iter().enumerate() {
                 match r {
-                    Ok((arch, digests)) => {
-                        for d in digests {
-                            digest.push((arch.to_owned(), d));
+                    Ok((image_digest, arch, d)) => {
+                        let blob = client.get_blob(
+                            image
+                                .image()
+                                .as_ref()
+                                .expect("already verified in fetch_digest_layer"),
+                            d.as_ref(),
+                        );
+
+                        let result = benchy::measure(blob).await.into_packed_layer(
+                            image_digest.clone(),
+                            arch.to_owned(),
+                            i,
+                        );
+
+                        tracing::trace!(image = %image, layer= i, "Downloaded layer");
+                        if let Err(e) = sender.send(result).await {
+                            tracing::trace!(error=%e, "receiver dropped");
+                            break;
                         }
                     }
                     Err(e) => {
@@ -465,27 +537,6 @@ impl super::Registry for Registry {
                 }
             }
 
-            for (index, (arch, digest)) in digest.iter().enumerate() {
-                let blob = client.get_blob(
-                    image
-                        .image()
-                        .as_ref()
-                        .expect("already verified in fetch_digest_layer"),
-                    digest,
-                );
-
-                let result = benchy::measure(blob).await.into_packed_layer(
-                    image_digest.clone(),
-                    arch.to_owned(),
-                    index,
-                );
-
-                tracing::trace!(image = %image, layer= index, "Downloaded layer");
-                if let Err(e) = sender.send(result).await {
-                    tracing::trace!(error=%e, "receiver dropped");
-                    break;
-                }
-            }
             drop(sender);
         });
 
@@ -496,7 +547,7 @@ impl super::Registry for Registry {
 impl Measured<Result<Vec<u8>, RegistryError>> {
     fn into_packed_layer(
         self,
-        digest: Option<String>,
+        digest: Option<Digest>,
         arch: String,
         index: usize,
     ) -> Result<PackedLayer, RegistryError> {
@@ -516,6 +567,7 @@ impl Measured<Result<Vec<u8>, RegistryError>> {
 pub mod fake {
     use std::collections::{HashMap, HashSet};
 
+    use docker_registry::mediatypes::MediaTypes;
     use itertools::Itertools;
     use mockito::Matcher;
     use sha2::{Digest, Sha256};
@@ -585,7 +637,7 @@ pub mod fake {
 
     impl<'a> BlobConfig<'a> {
         pub fn new(image: &'a Image, architecture: String, layer: Vec<Layer<'a>>) -> Self {
-            let digest = digest(image.to_string().as_bytes());
+            let digest = digest(format!("{image}{architecture}").as_bytes());
             Self {
                 image,
                 digest,
@@ -668,25 +720,72 @@ pub mod fake {
             )
         }
 
-        fn mock(&self, server: &mut mockito::ServerGuard, status_code: usize) -> mockito::Mock {
-            let path = format!(
+        pub fn list_json(&self) -> String {
+            let manifests = format!(
+                r#"
+            [
+            {{
+                "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+                "digest": "{}",
+                "size": {},
+                "platform": {{
+                  "architecture": "ppc64le",
+                  "os": "linux"
+                }}
+            }}
+            ]
+            "#,
+                self.blobconfig.digest,
+                self.blobconfig.size()
+            );
+
+            format!(
+                r#"
+
+{{
+  "schemaVersion": 2,
+  "mediaType": "application/vnd.docker.distribution.manifest.list.v2+json",
+  "manifests": {manifests}
+}}
+                "#
+            )
+        }
+
+        fn mock(
+            &self,
+            server: &mut mockito::ServerGuard,
+            status_code: usize,
+        ) -> Vec<mockito::Mock> {
+            let ml_path = format!(
                 "/v2/{}/manifests/{}",
                 self.blobconfig.image.image().unwrap(),
                 self.blobconfig.image.tag().unwrap()
             );
-            server
-                .mock("GET", &path as &str)
-                .with_status(status_code)
-                .with_header(
-                    "Content-Type",
-                    "application/vnd.docker.distribution.manifest.v2+json",
-                )
-                .with_header(
-                    "docker-content-digest",
-                    "application/vnd.docker.distribution.manifest.v2+json",
-                )
-                .with_body(self.json())
-                .create()
+            let image_path = format!(
+                "/v2/{}/manifests/{}",
+                self.blobconfig.image.image().unwrap(),
+                self.blobconfig.digest
+            );
+            let mut mock_it = |media_type, path: &str, json| {
+                server
+                    .mock("GET", path)
+                    .with_status(status_code)
+                    .with_header("Content-Type", media_type)
+                    .with_body(json)
+                    .create()
+            };
+            vec![
+                mock_it(
+                    MediaTypes::ManifestList.to_mime().as_ref(),
+                    &ml_path,
+                    self.list_json(),
+                ),
+                mock_it(
+                    MediaTypes::ManifestV2S2.to_mime().as_ref(),
+                    &image_path,
+                    self.json(),
+                ),
+            ]
         }
     }
 
@@ -702,7 +801,7 @@ pub mod fake {
         ) -> Vec<mockito::Mock> {
             const NICHTSFREI_VICTIM_LAYER: &[u8] = include_bytes!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
-                "/test-data/layers/victim.tar.gz"
+                "/data/tests/layers/victim.tar.gz"
             ));
 
             // we currently just have one layer example and are repeating it for each image.
@@ -801,7 +900,7 @@ pub mod fake {
             match self {
                 FakeResponses::Manifest(manifest) => {
                     let mut results = Vec::with_capacity(self.mock_count());
-                    results.push(manifest.mock(server, next_sc()));
+                    results.extend(manifest.mock(server, next_sc()));
                     results.push(manifest.blobconfig.mock(server, next_sc()));
                     for l in manifest.blobconfig.layer.iter() {
                         results.push(l.mock(server, manifest.blobconfig.image, next_sc()));
@@ -884,11 +983,11 @@ pub mod fake {
 
         /// Creates a registry v2 mock that can be used for testing
         ///
-        /// Creates caralog and image list for each given image, but manifest as well as bloc
+        /// Creates caralog and image list for each given image, but manifest as well as block
         /// download only for nichtsfrei/victim:latest. This is because there is just one binary
         /// layer available at the moment.
         ///
-        /// If new entries are added to the build.rs and inside `test-data/;layers` those
+        /// If new entries are added to the build.rs and inside `data/tests/layers` those
         /// manifest_mocks needs to be extended within FakeResponses::Pull.
         pub async fn serve_images(images: &[Image], status_codes: &[usize]) -> Self {
             let mut port_expander: PortExpander = status_codes.into();

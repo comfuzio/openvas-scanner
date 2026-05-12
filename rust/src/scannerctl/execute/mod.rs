@@ -5,7 +5,7 @@
 use std::fs::File;
 use std::io::stdin;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use clap::Subcommand;
 use futures::StreamExt;
@@ -13,13 +13,15 @@ use scannerlib::feed::{HashSumNameLoader, Update};
 use scannerlib::models;
 use scannerlib::nasl::nasl_std_functions;
 use scannerlib::nasl::syntax::Loader;
+use scannerlib::nasl::utils::scan_ctx::NotusCtx;
+use scannerlib::notus::{Notus, ProductLoader};
 use scannerlib::scanner::preferences::preference::ScanPrefs;
 use scannerlib::scanner::{Scan, ScanRunner};
-use scannerlib::scheduling::{ExecutionPlaner, WaveExecutionPlan};
+use scannerlib::scheduling::Scheduler;
 use scannerlib::storage::inmemory::InMemoryStorage;
 use tracing::{info, warn, warn_span};
 
-use crate::utils::ArgOrStdin;
+use crate::utils::{ArgOrStdin, NotusArgs};
 use crate::{CliError, CliErrorKind, Db, interpret};
 
 #[derive(clap::Parser)]
@@ -56,6 +58,11 @@ struct ScriptArgs {
     timeout: Option<u32>,
     #[clap(long = "vendor")]
     vendor_version: Option<String>,
+    /// Notus configuration. Use "<IP:PORT>" to connect to a running Notus
+    /// instance or "<PATH>" to product files to use the internal
+    /// implementation. If not given Notus will be disabled.
+    #[clap(short, long = "notus")]
+    notus: Option<NotusArgs>,
 }
 
 #[derive(clap::Parser)]
@@ -70,9 +77,15 @@ struct ScanArgs {
     /// Target to scan.
     #[clap(short, long)]
     target: Option<String>,
+    /// Notus configuration. Use "<IP:PORT>" to connect to a running Notus
+    /// instance or "<PATH>" to product files to use the internal
+    /// implementation. If not given Notus will be disabled.
+    #[clap(short, long = "notus")]
+    notus: Option<NotusArgs>,
 }
 
 pub async fn run(args: ExecuteArgs) -> Result<(), CliError> {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     match args.action {
         Action::Script(args) => script(args).await,
         Action::Scan(args) => scan(args).await,
@@ -96,8 +109,10 @@ async fn scan(args: ScanArgs) -> Result<(), CliError> {
     updater.perform_update().await?;
 
     let vts_cloned = scan.vts.clone();
-    let schedule = storage
-        .execution_plan::<WaveExecutionPlan>(&vts_cloned)
+    let scheduler = Scheduler::new(storage.clone());
+    let schedule = scheduler
+        .execution_plan(&vts_cloned)
+        .await
         .expect("expected to be schedulable");
     info!("creating scheduling plan");
     if args.schedule_only {
@@ -115,8 +130,15 @@ async fn scan(args: ScanArgs) -> Result<(), CliError> {
     } else {
         let executor = nasl_std_functions();
         let scan = Scan::default_to_localhost(scan);
+        let notus = args.notus.map(|x| match x {
+            NotusArgs::Address(addr) => NotusCtx::Address(addr),
+            NotusArgs::Internal(path) => NotusCtx::Direct(Arc::new(Mutex::new(Notus::new(
+                // we don't require a correctly setup feed for scannerctl
+                ProductLoader::new(false, Loader::from_feed_path(path)),
+            )))),
+        });
         let runner: ScanRunner<Arc<InMemoryStorage>> =
-            ScanRunner::new(&storage, &loader, &executor, schedule, &scan).unwrap();
+            ScanRunner::new(&storage, &loader, &executor, schedule, &scan, &notus).unwrap();
         let mut results = Box::pin(runner.stream());
         while let Some(x) = results.next().await {
             match x {
@@ -141,6 +163,13 @@ async fn scan(args: ScanArgs) -> Result<(), CliError> {
 }
 
 async fn script(args: ScriptArgs) -> Result<(), CliError> {
+    let notus = args.notus.map(|x| match x {
+        NotusArgs::Address(addr) => NotusCtx::Address(addr),
+        NotusArgs::Internal(path) => NotusCtx::Direct(Arc::new(Mutex::new(Notus::new(
+            // scannerctl doesn't require a proper feed
+            ProductLoader::new(false, Loader::from_feed_path(path)),
+        )))),
+    });
     let scan_preferences = ScanPrefs::new()
         .set_default_recv_timeout(args.timeout)
         .set_vendor_version(args.vendor_version);
@@ -153,6 +182,7 @@ async fn script(args: ScriptArgs) -> Result<(), CliError> {
         args.ports.clone(),
         args.udp_ports.clone(),
         scan_preferences,
+        notus,
     )
     .await
 }

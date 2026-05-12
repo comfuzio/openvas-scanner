@@ -7,7 +7,7 @@ mode = 'service'
 [feed]
 path = '/var/lib/openvas/plugins'
 check_interval = '3600s'
-signature_check = false
+signature_check = true
 
 [notus]
 products_path = '/var/lib/notus/products'
@@ -34,24 +34,20 @@ check_interval = '2s'
 
 [scanner]
 type = 'ospd'
-
 [scanner.ospd]
 socket = '/var/run/ospd/ospd-openvas.sock'
-
 [scanner.preferences]
 aaa = false
 
 [container_image_scanner]
-max_scans = 1
-
+max_scans = 5
 [container_image_scanner.database]
 location = 'in-memory'
 busy_timeout = '10s'
 max_connections = 1
-
 [container_image_scanner.image]
 extract_to = '/tmp/openvasd/cis'
 max_scanning = 10
 scanning_retries = 3
-batch_size = 3
+batch_size = 2
 retry_timeout = '1s'

@@ -15,6 +15,7 @@
 #include "nasl_func.h"
 #include "nasl_global_ctxt.h"
 #include "nasl_init.h"
+#include "nasl_krb5.h" /* for nasl_okrb5_clean */
 #include "nasl_lex_ctxt.h"
 #include "nasl_tree.h"
 #include "nasl_var.h"
@@ -1233,7 +1234,7 @@ nasl_exec (lex_ctxt *lexic, tree_cell *st)
 
       /*
        * Anything added to a string is converted to a string
-       * Otherwise anything added to an intger is converted into an integer
+       * Otherwise anything added to an integer is converted into an integer
        */
       if (tc1->type == CONST_DATA || tc2->type == CONST_DATA)
         flag = CONST_DATA;
@@ -1654,7 +1655,7 @@ exec_nasl_script (struct script_infos *script_infos, int mode)
   else
     ctx.kb = plug_get_kb (script_infos);
 
-  if (init_nasl_ctx (&ctx, name) == 0)
+  if (init_nasl_ctx (&ctx, NULL, name) == 0)
     {
       err = naslparse (&ctx, &error_counter);
       if (err != 0 || error_counter > 0)
@@ -1706,7 +1707,7 @@ exec_nasl_script (struct script_infos *script_infos, int mode)
     }
   else if (!(mode & NASL_EXEC_PARSE_ONLY))
     {
-      char *p;
+      char *p, *name_aux;
 
       bzero (&tc, sizeof (tc));
       tc.type = CONST_INT;
@@ -1719,14 +1720,18 @@ exec_nasl_script (struct script_infos *script_infos, int mode)
       add_named_var_to_ctxt (lexic, "description", &tc);
 
       tc.type = CONST_DATA;
-      p = strrchr (name, '/');
+      // for preserving the const qualifier during assignment
+      name_aux = g_strdup (name);
+      p = strrchr (name_aux, '/');
       if (p == NULL)
-        p = (char *) name;
+        p = (char *) name_aux;
       else
         p++;
+
       tc.x.str_val = p;
       tc.size = strlen (p);
       add_named_var_to_ctxt (lexic, "SCRIPT_NAME", &tc);
+      g_free (name_aux);
 
       truc = (lex_ctxt *) ctx.tree;
       if ((ret = nasl_exec (lexic, ctx.tree)) == NULL)
@@ -1736,6 +1741,7 @@ exec_nasl_script (struct script_infos *script_infos, int mode)
 
       if ((pf = get_func_ref_by_name (lexic, "on_exit")) != NULL)
         nasl_func_call (lexic, pf, NULL);
+
     }
 
   if (g_chdir (old_dir) != 0)
@@ -1745,6 +1751,7 @@ exec_nasl_script (struct script_infos *script_infos, int mode)
     }
   g_free (old_dir);
 
+  nasl_okrb5_clean ();
   nasl_clean_ctx (&ctx);
   free_lex_ctxt (lexic);
   return err;

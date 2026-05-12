@@ -40,8 +40,8 @@ use tokio::sync::RwLock;
 use crate::nasl::syntax::Loader;
 use crate::nasl::utils::Executor;
 use crate::nasl::utils::scan_ctx::ContextStorage;
+use crate::nasl::utils::scan_ctx::NotusCtx;
 use crate::scheduling::SchedulerStorage;
-use crate::scheduling::WaveExecutionPlan;
 use crate::storage::Remover;
 use crate::storage::ScanID;
 use greenbone_scanner_framework::models;
@@ -53,21 +53,20 @@ pub struct OpenvasdScanner<S> {
     storage: Arc<S>,
     loader: Arc<Loader>,
     function_executor: Arc<Executor>,
+    notus: Option<NotusCtx>,
 }
 
 impl<S> OpenvasdScanner<S>
 where
     S: ContextStorage + SchedulerStorage + Sync + Send + Clone + 'static,
 {
-    // TODO: Actually use this in normal execution, so we can remove
-    // the cfg directive here.
-    #[cfg(test)]
-    fn new(storage: S, loader: Loader, executor: Executor) -> Self {
+    pub fn new(storage: S, loader: Loader, executor: Executor, notus: Option<NotusCtx>) -> Self {
         Self {
             running: Arc::new(RwLock::new(HashMap::default())),
             storage: Arc::new(storage),
             loader: Arc::new(loader),
             function_executor: Arc::new(executor),
+            notus,
         }
     }
 
@@ -77,7 +76,7 @@ where
         let function_executor = self.function_executor.clone();
         let id = scan.scan_id.clone();
         let handle =
-            RunningScan::<S>::start::<WaveExecutionPlan>(scan, storage, loader, function_executor);
+            RunningScan::<S>::start(scan, storage, loader, function_executor, self.notus.clone());
         self.running.write().await.insert(id, handle);
         Ok(())
     }
@@ -128,6 +127,7 @@ where
         self.stop_scan(id).await?;
         self.storage
             .remove(&scan_id)
+            .await
             .map_err(|_| Error::ScanNotFound(scan_id.0))?;
         Ok(())
     }
@@ -148,14 +148,17 @@ where
             .get(id)
             .ok_or_else(|| Error::ScanNotFound(id.to_string()))?;
         let status = r.status().await;
+        let scan_id = ScanID(id.to_string());
+        let results = self
+            .storage
+            .remove(&scan_id)
+            .await
+            .map_err(|e| Error::Unexpected(e.to_string()))?
+            .unwrap_or_default();
         Ok(ScanResults {
             id: id.to_string(),
             status,
-            // TODO: verify
-            // The results are directly stored by the storage implementation:
-            // inmemory.rs
-            // file.rs
-            results: vec![],
+            results,
         })
     }
 }

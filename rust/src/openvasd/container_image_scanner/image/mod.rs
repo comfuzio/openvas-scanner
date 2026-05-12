@@ -8,16 +8,14 @@ pub use registry::{
 pub mod extractor;
 #[cfg(test)]
 pub use registry::docker_v2::fake::RegistryMock as DockerRegistryV2Mock;
-use scannerlib::SQLITE_LIMIT_VARIABLE_NUMBER;
-use sqlx::{QueryBuilder, query};
 
 pub mod packages;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, PartialOrd, Eq)]
 pub struct Image {
     pub registry: String,
-    image: Option<String>,
-    tag: Option<String>,
+    pub image: Option<String>,
+    pub tag: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -78,50 +76,6 @@ impl Image {
         self.tag = Some(new_tag);
         self
     }
-
-    pub async fn insert(
-        tx: &mut sqlx::SqliteConnection,
-        scan_id: i64,
-        state: ImageState,
-        images: Vec<String>,
-    ) -> Result<(), sqlx::Error> {
-        for image in images.chunks(SQLITE_LIMIT_VARIABLE_NUMBER / 2) {
-            let mut builder = QueryBuilder::new("INSERT OR IGNORE INTO images (id, image, status)");
-            builder.push_values(image, |mut b, img| {
-                b.push_bind(scan_id)
-                    .push_bind(img)
-                    .push_bind(state.as_ref());
-            });
-            let query = builder.build();
-            query.execute(&mut *tx).await?;
-        }
-        Ok(())
-    }
-
-    pub(crate) async fn is_digest_excluded(
-        pool: &sqlx::Pool<sqlx::Sqlite>,
-        id: &str,
-        image: &Image,
-        digest: Option<&String>,
-    ) -> bool {
-        if let Some(digest) = digest {
-            let digest = image.clone().replace_tag(digest.clone()).to_string();
-            match query("SELECT id FROM images WHERE id = ? AND image = ?")
-                .bind(id)
-                .bind(&digest)
-                .fetch_optional(pool)
-                .await
-            {
-                Err(error) => {
-                    tracing::warn!(image=%digest, %error, "Unable to verify for excluded host.");
-                    false
-                }
-                Ok(x) => x.is_some(),
-            }
-        } else {
-            false
-        }
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
@@ -132,11 +86,38 @@ pub enum ImageParseError {
     NoRegistry,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct Digest(String);
+
+impl AsRef<str> for Digest {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<String> for Digest {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
+impl From<Digest> for String {
+    fn from(value: Digest) -> Self {
+        value.0
+    }
+}
+
+impl From<&str> for Digest {
+    fn from(value: &str) -> Self {
+        Self::from(value.to_owned())
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PackedLayer {
     pub data: Vec<u8>,
     pub index: usize,
-    pub digest: Option<String>,
+    pub digest: Option<Digest>,
     pub arch: String,
     pub download_time: Duration,
 }

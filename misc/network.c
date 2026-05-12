@@ -1657,7 +1657,7 @@ nrecv (int fd, void *data, int length, int i_opt)
  * test whether they need to close the stream them self.  See argument
  * to the hook function is the file descriptor of the stream.  The
  * hook shall return 0 if it has taken over control of that file
- * descriptor.  The same function is only aded once to the list of
+ * descriptor.  The same function is only added once to the list of
  * hooks.
  *
  * @param fnc  The hook function.  See above for details.
@@ -1778,7 +1778,7 @@ get_encaps_through (openvas_encaps_t code)
     case OPENVAS_ENCAPS_TLSv12:
     case OPENVAS_ENCAPS_TLSv13:
     case OPENVAS_ENCAPS_TLScustom:
-      return " through SSL";
+      return " through SSL/TLS";
     default:
       snprintf (str, sizeof (str),
                 " through unknown transport layer - code %d (0x%x)", code,

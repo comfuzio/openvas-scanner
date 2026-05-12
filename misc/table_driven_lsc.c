@@ -454,7 +454,7 @@ advisories_new_skiron ()
 {
   advisories_t *advisories_list = g_malloc0 (sizeof (advisories_t));
   advisories_list->max_size = 100;
-  advisories_list->skiron_advisory =
+  advisories_list->skiron_advisories =
     g_malloc0_n (advisories_list->max_size, sizeof (skiron_advisory_t));
   advisories_list->type = SKIRON;
 
@@ -569,6 +569,17 @@ advisory_free (advisory_t *notus_advisory)
   notus_advisory = NULL;
 }
 
+static void
+skiron_advisory_free (skiron_advisory_t *skiron_advisory)
+{
+  if (skiron_advisory == NULL)
+    return;
+
+  g_free (skiron_advisory->oid);
+  g_free (skiron_advisory->message);
+  skiron_advisory = NULL;
+}
+
 /** @brief Free()'s an advisories
  *
  *  @param notus_advisory The advisories holder to be free()'ed.
@@ -579,9 +590,13 @@ advisories_free (advisories_t *advisories)
 {
   if (advisories == NULL)
     return;
-
   for (size_t i = 0; i < advisories->count; i++)
-    advisory_free (advisories->advisories[i]);
+    {
+      if (advisories->type == NOTUS)
+        advisory_free (advisories->advisories[i]);
+      else
+        skiron_advisory_free (advisories->skiron_advisories[i]);
+    }
   advisories = NULL;
 }
 
@@ -638,8 +653,7 @@ lsc_process_response_notus (JsonReader *reader)
 
   if (!members || !members[0])
     {
-      g_debug ("No members found");
-      return NULL;
+      return advisories;
     }
 
   for (int i = 0; members[i]; i++)
@@ -740,6 +754,7 @@ lsc_process_response_notus (JsonReader *reader)
               g_free (installed_version);
               g_free (item1);
               g_free (item2);
+              advisory_free (notus_advisory);
               advisories_free (advisories);
               return NULL;
             }
@@ -1066,6 +1081,15 @@ call_rs_notus (const char *ip_str, const char *hostname, const char *pkg_list,
       advisory_t *notus_advisory = advisories->advisories[i];
       gchar *buffer;
       GString *result = g_string_new (NULL);
+
+      if (!notus_advisory)
+        {
+          g_message ("%s: Unable to process response. No notus advisories",
+                     __func__);
+          g_string_free (result, TRUE);
+          advisories_free (advisories);
+          return -1;
+        }
       for (size_t j = 0; j < notus_advisory->count; j++)
         {
           vuln_pkg_t *pkg = notus_advisory->pkgs[j];

@@ -6,7 +6,7 @@ jobs:
   C:
     runs-on: ubuntu-latest
     container:
-      image: registry.community.greenbone.net/community/gvm-libs:stable
+      image: ghcr.io/greenbone/gvm-libs:stable
     steps:
       - uses: actions/checkout@v6
       - name: install dependencies
@@ -24,7 +24,10 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: ./.github/actions/setup-rust
+      - name: Prepare nasl-c-lib archives
+        run: make
+      - run: cd crates/rpmdb-rs && sh prepare-test-data.sh
       - name: unit-tests
         run: cargo test --lib --tests --workspace
       - name: experimental unit-tests
-        run: cargo test --lib --tests --workspace --features experimental
+        run: cargo test --lib --tests --workspace --features native-rust-ssh

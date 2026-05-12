@@ -8,10 +8,14 @@ use std::{
     fmt::{self, Display, Formatter},
     panic::Location,
     path::PathBuf,
+    sync::{Arc, Mutex},
 };
 
-use crate::storage::{ScanID, inmemory::InMemoryStorage};
-use crate::{nasl::prelude::*, scanner::preferences::preference::ScanPrefs};
+use crate::{nasl::prelude::*, notus::Notus, scanner::preferences::preference::ScanPrefs};
+use crate::{
+    nasl::utils::scan_ctx::NotusCtx,
+    storage::{ScanID, inmemory::InMemoryStorage},
+};
 use futures::{Stream, StreamExt};
 
 use super::{
@@ -129,6 +133,7 @@ pub struct TestBuilder<S: ContextStorage> {
     storage: S,
     executor: Executor,
     version: NaslVersion,
+    notus: Option<Arc<Mutex<Notus>>>,
 }
 
 pub type DefaultTestBuilder = TestBuilder<InMemoryStorage>;
@@ -147,6 +152,7 @@ impl Default for TestBuilder<InMemoryStorage> {
             storage: InMemoryStorage::default(),
             executor: nasl_std_functions(),
             version: NaslVersion::default(),
+            notus: None,
         }
     }
 }
@@ -172,6 +178,7 @@ where
             storage,
             executor: nasl_std_functions(),
             version: NaslVersion::default(),
+            notus: None,
         }
     }
 }
@@ -194,11 +201,10 @@ impl TestBuilder<InMemoryStorage> {
             storage: InMemoryStorage::default(),
             executor: nasl_std_functions(),
             version: NaslVersion::default(),
+            notus: None,
         }
     }
-}
 
-impl TestBuilder<InMemoryStorage> {
     /// Construct a `TestBuilder`, immediately run the
     /// given code on it and return it.
     pub fn from_code(code: impl AsRef<str>) -> Self {
@@ -211,6 +217,23 @@ impl TestBuilder<InMemoryStorage> {
         let mut t = Self::default().with_nasl_version(NaslVersion::V2);
         t.run_all(code.as_ref());
         t
+    }
+
+    pub fn from_notus(notus: Arc<Mutex<Notus>>) -> Self {
+        Self {
+            lines: vec![],
+            results: vec![],
+            scan_id: Default::default(),
+            filename: Default::default(),
+            target: Default::default(),
+            variables: vec![],
+            should_verify: true,
+            loader: Loader::test_empty(),
+            storage: InMemoryStorage::default(),
+            executor: nasl_std_functions(),
+            version: NaslVersion::default(),
+            notus: Some(notus),
+        }
     }
 }
 
@@ -355,6 +378,7 @@ where
             filename: self.filename.clone(),
             scan_preferences: ScanPrefs::new(),
             alive_test_methods: Vec::default(),
+            notus: self.notus.as_ref().map(|x| NotusCtx::Direct(x.clone())),
         }
         .build()
     }
@@ -452,7 +476,7 @@ where
         self
     }
 
-    #[cfg(all(test, feature = "experimental"))]
+    #[cfg(test)]
     /// Return a new `TestBuilder` with the given `target`.
     pub fn with_target(mut self, target: String) -> Self {
         self.target = target;

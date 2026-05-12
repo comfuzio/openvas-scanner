@@ -1,9 +1,6 @@
 mod benchy;
 pub mod config;
-use std::{
-    sync::{Arc, RwLock},
-    time::Duration,
-};
+use std::sync::{Arc, RwLock};
 
 pub use config::Config;
 use futures::{Stream, StreamExt};
@@ -17,7 +14,7 @@ mod image;
 mod messages;
 mod notus;
 mod scheduling;
-pub(crate) use scannerlib::{ExternalError, PinBoxFut, PinBoxFutRef, Streamer};
+pub(crate) use scannerlib::{ExternalError, Promise, PromiseRef, Streamer};
 
 /// combines slices on compile time
 #[macro_export]
@@ -81,15 +78,17 @@ static MIGRATOR: Migrator = sqlx::migrate!("./src/openvasd/container_image_scann
 use endpoints::scans::Scans;
 //TODO: move endpoints to openvasd?
 use endpoints::vts::VTEndpoints;
-use sqlx::SqlitePool;
 
-use scannerlib::notus::{HashsumProductLoader, Notus};
+use scannerlib::notus::Notus;
 
-use crate::vts::sql::SqlPluginStorage;
+use crate::{
+    container_image_scanner::scheduling::db::DataBase, database::sqlite::vts::SqlPluginStorage,
+};
+
 pub async fn init(
-    vt_pool: SqlitePool,
+    vt_pool: DataBase,
     feed_state: Arc<RwLock<FeedState>>,
-    products: Arc<tokio::sync::RwLock<Notus<HashsumProductLoader>>>,
+    products: Arc<tokio::sync::RwLock<Notus>>,
     config: Config,
 ) -> Result<(Scans, VTEndpoints), Box<dyn std::error::Error + Send + Sync>> {
     let pool = config
@@ -98,19 +97,16 @@ pub async fn init(
         .await?;
     MIGRATOR.run(&pool).await?;
 
-    let (sender, scheduler) = Scheduler::<DockerRegistryV2, filtered_image::Extractor>::init(
+    let scheduler = Scheduler::<DockerRegistryV2, filtered_image::Extractor>::init(
         config.into(),
         pool.clone(),
         products,
     );
     tokio::spawn(async move {
-        scheduler.run::<AllTypes>(Duration::from_secs(10)).await;
+        scheduler.run::<AllTypes>().await;
     });
 
-    let scan = Scans {
-        pool,
-        scheduling: sender,
-    };
+    let scan = Scans { pool };
     let vts = VTEndpoints::new(
         SqlPluginStorage::from(vt_pool),
         feed_state,

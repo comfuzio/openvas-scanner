@@ -457,7 +457,7 @@ check_kb_inconsistency (kb_t main_kb)
       return 0;
     }
 
-  g_warning ("KB inconsitency. %s writing into %s KB", original_scan_id,
+  g_warning ("KB inconsistency. %s writing into %s KB", original_scan_id,
              current_scan_id);
   g_free (current_scan_id);
   return -3;
@@ -750,7 +750,7 @@ proto_post_wrapped (const char *oid, struct script_infos *desc, int port,
   if (!data)
     {
       g_warning ("%s: Error converting to UTF-8: %s\nOriginal string: %s",
-                 __func__, err->message, buffer);
+                 __func__, err ? err->message: "", buffer);
       g_free (buffer);
       g_string_free (action_str, TRUE);
       return;

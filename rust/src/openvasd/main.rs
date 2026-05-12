@@ -9,6 +9,7 @@
 mod config;
 mod container_image_scanner;
 mod crypt;
+mod database;
 mod json_stream;
 mod notus;
 mod scans;
@@ -25,6 +26,7 @@ use container_image_scanner::config::{DBLocation, SqliteConfiguration};
 use greenbone_scanner_framework::{RuntimeBuilder, ServerCertificate};
 use notus::config_to_products;
 use scannerlib::models::FeedState;
+use scannerlib::utils::version::show_version;
 use sqlx::SqlitePool;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -58,12 +60,15 @@ async fn setup_sqlite(config: &Config) -> Result<SqlitePool> {
     Ok(result)
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+async fn _main() -> Result<i32> {
     let config = Config::load();
-    config.logging.init();
+    let _guard = config.logging.init();
 
-    //TODO: AsRef impl for Config
+    show_version("openvasd");
+    if config.version {
+        return Ok(0);
+    }
+
     let products = config_to_products(&config);
     let pool = setup_sqlite(&config).await?;
     let feed_snapshot = Arc::new(std::sync::RwLock::new(FeedState::Unknown));
@@ -73,8 +78,6 @@ async fn main() -> Result<()> {
     let (get_notus, post_notus) = notus::init(products.clone());
 
     let mut rb = RuntimeBuilder::<greenbone_scanner_framework::End>::new(config.listener.address)
-        // TODO: use a lambda like in scanner instead.
-        // That way we don't need to manage tokio::spawn_blocking all over the place
         .feed_version(feed_snapshot.clone());
     match (config.tls.certs.clone(), config.tls.key.clone()) {
         (Some(certificate), Some(key)) => {
@@ -89,6 +92,11 @@ async fn main() -> Result<()> {
             )
         }
     };
+    if !config.feed.signature_check {
+        tracing::warn!(
+            "Integrity check for feed has been disabled. Neither hashsums nor GPG signature will get verified."
+        );
+    }
     if let Some(client_certs) = config.tls.client_certs.clone() {
         rb = rb.path_client_certs(client_certs);
     }
@@ -109,4 +117,17 @@ async fn main() -> Result<()> {
         .insert_additional_scan_endpoints(Arc::new(cis_scans), Arc::new(cis_vts))
         .run_blocking()
         .await
+}
+
+#[tokio::main]
+async fn main() {
+    let rc = match _main().await {
+        Ok(x) => x,
+        Err(error) => {
+            panic!("{error}")
+        }
+    };
+    // we call process exit, on return ExitCode it kept lingering.
+    // when a task is blocking.
+    std::process::exit(rc);
 }

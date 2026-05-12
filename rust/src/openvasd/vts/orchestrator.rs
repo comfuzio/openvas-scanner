@@ -6,7 +6,7 @@ use tokio::sync::RwLock;
 use greenbone_scanner_framework::GetVTsError;
 use greenbone_scanner_framework::models::FeedType;
 use scannerlib::models::FeedState;
-use scannerlib::{PinBoxFut, feed};
+use scannerlib::{Promise, feed};
 use tokio::sync::mpsc;
 
 use crate::vts::FeedHashes;
@@ -132,9 +132,9 @@ pub enum FeedStatusChange {
 pub enum WorkerError {
     #[error("Unable to fetch cached hash: {0}")]
     Cache(#[from] sqlx::error::Error),
-    #[error("Unable to calculate hash: {0}")]
+    #[error(transparent)]
     Calculation(#[from] feed::VerifyError),
-    #[error("Unable to synchronize: {0}")]
+    #[error(transparent)]
     Sync(#[from] GetVTsError),
     #[error("Unable to serialize: {0}")]
     Serialization(#[from] serde_json::Error),
@@ -143,13 +143,13 @@ pub enum WorkerError {
 }
 
 pub trait Worker {
-    fn cached_hashes(&self) -> PinBoxFut<Result<Option<FeedHashes>, WorkerError>>;
+    fn cached_hashes(&self) -> Promise<Result<Option<FeedHashes>, WorkerError>>;
 
     fn signature_check(&self) -> bool;
     fn plugin_feed(&self) -> PathBuf;
     fn advisory_feed(&self) -> PathBuf;
 
-    fn calculated_hashes(&self) -> PinBoxFut<Result<FeedHashes, WorkerError>> {
+    fn calculated_hashes(&self) -> Promise<Result<FeedHashes, WorkerError>> {
         let signature_check = self.signature_check();
         let plugin_feed = self.plugin_feed();
         let advisory_feed = self.advisory_feed();
@@ -159,12 +159,12 @@ pub trait Worker {
             Ok((nasl_hash, advisories_hash))
         })
     }
-    fn update_feed(&self, kind: FeedType, new_hash: String) -> PinBoxFut<Result<(), WorkerError>>;
+    fn update_feed(&self, kind: FeedType, new_hash: String) -> Promise<Result<(), WorkerError>>;
 
     fn calculate_hash(
         signature_check: bool,
         path: PathBuf,
-    ) -> PinBoxFut<Result<String, feed::VerifyError>> {
+    ) -> Promise<Result<String, feed::VerifyError>> {
         Box::pin(async move {
             tokio::task::spawn_blocking(move || {
                 if signature_check {
@@ -336,18 +336,23 @@ where
                     nasl_handle,
                     sync_advisories,
                     advisories_handle,
-                    "Continue wairing for Allow message"
+                    "Continue waiting for Allow message"
                 ),
             }
         }
 
+        let handle_worker_result = async move |feed_type, result: Result<(), WorkerError>| {
+            if let Err(error) = result {
+                tracing::warn!(%error, %feed_type, "Unable to update feed.");
+            }
+            send_synced(feed_type).await
+        };
+
         if let Some(handle) = nasl_handle {
-            handle.await.unwrap()?;
-            send_synced(FeedType::NASL).await?;
+            handle_worker_result(FeedType::NASL, handle.await.unwrap()).await?;
         }
         if let Some(handle) = advisory_handle {
-            handle.await.unwrap()?;
-            send_synced(FeedType::Advisories).await?;
+            handle_worker_result(FeedType::Advisories, handle.await.unwrap()).await?;
         }
         self.change_outer_state(FeedState::Synced(calc_nasl, calc_advisories))
             .await;
@@ -366,17 +371,17 @@ pub mod test {
     }
 
     impl Worker for Yesman {
-        fn cached_hashes(&self) -> PinBoxFut<Result<Option<FeedHashes>, WorkerError>> {
+        fn cached_hashes(&self) -> Promise<Result<Option<FeedHashes>, WorkerError>> {
             let cached = self.cached.clone();
             Box::pin(async move { Ok(cached) })
         }
 
-        fn calculated_hashes(&self) -> PinBoxFut<Result<FeedHashes, WorkerError>> {
+        fn calculated_hashes(&self) -> Promise<Result<FeedHashes, WorkerError>> {
             let calculated = self.calculated.clone();
             Box::pin(async move { Ok(calculated) })
         }
 
-        fn update_feed(&self, _: FeedType, _: String) -> PinBoxFut<Result<(), WorkerError>> {
+        fn update_feed(&self, _: FeedType, _: String) -> Promise<Result<(), WorkerError>> {
             Box::pin(async move { Ok(()) })
         }
 

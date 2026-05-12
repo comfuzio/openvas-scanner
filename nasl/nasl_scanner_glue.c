@@ -37,6 +37,7 @@
 #include <gvm/base/networking.h> /* for addr6_to_str */
 #include <gvm/base/prefs.h>      /* for prefs_get */
 #include <gvm/util/kb.h>         /* for KB_TYPE_INT */
+#include <stddef.h>
 #include <stdlib.h>              /* for atoi */
 #include <string.h>              /* for strcmp */
 #include <sys/stat.h>            /* for stat */
@@ -807,7 +808,7 @@ replace_kb_item (lex_ctxt *lexic)
   else
     {
       char *value = get_str_var_by_name (lexic, "value");
-      int len = get_var_size_by_name (lexic, "value");
+      size_t len = get_var_size_by_name (lexic, "value");
 
       if (value == NULL)
         {
@@ -862,7 +863,7 @@ set_kb_item_volatile (lex_ctxt *lexic)
   else
     {
       char *value = get_str_var_by_name (lexic, "value");
-      int len = get_var_size_by_name (lexic, "value");
+      size_t len = get_var_size_by_name (lexic, "value");
       if (value == NULL || expire == -1)
         {
           nasl_perror (lexic,
@@ -921,7 +922,7 @@ set_kb_item (lex_ctxt *lexic)
   else
     {
       char *value = get_str_var_by_name (lexic, "value");
-      int len = get_var_size_by_name (lexic, "value");
+      size_t len = get_var_size_by_name (lexic, "value");
       if (value == NULL)
         {
           nasl_perror (
@@ -969,8 +970,8 @@ security_something (lex_ctxt *lexic, proto_post_something_t proto_post_func,
 
   if (data != NULL)
     {
-      int len = get_var_size_by_name (lexic, "data");
-      int i;
+      size_t len = get_var_size_by_name (lexic, "data");
+      size_t i;
 
       dup = g_malloc0 ((len + 1) * sizeof (char *));
       memcpy (dup, data, len + 1);
@@ -1140,12 +1141,17 @@ security_notus (lex_ctxt *lexic)
   // type|||IP|||HOSTNAME|||package|||OID|||the result message|||URI
   kb_result = g_strdup_printf ("%s|||%s|||%s|||%s|||%s|||%s|||%s", "ALARM",
                                ip_str, " ", "package", oid, result_string, "");
-  g_free (result_string);
+
+  // Only free result_string for notus type, as skiron uses a reference to a
+  // nasl var
+  if (notus_type == NOTUS)
+    g_free (result_string);
+
   kb_item_push_str_with_main_kb_check (get_main_kb (), "internal/results",
                                        kb_result);
   g_free (kb_result);
 
-  return NULL;
+  return FAKE_CELL;
 }
 
 /**
@@ -1386,7 +1392,7 @@ parse_skiron (advisories_t *adv)
 
   for (size_t i = 0; i < adv->count; i++)
     {
-      skiron_advisory_t *advisory = adv->skiron_advisory[i];
+      skiron_advisory_t *advisory = adv->skiron_advisories[i];
       anon_nasl_var msg, oid;
 
       memset (&element, 0, sizeof (element));
@@ -1406,8 +1412,8 @@ parse_skiron (advisories_t *adv)
       add_var_to_array (&element.v.v_arr, "message", &msg);
       add_var_to_list (retc->x.ref_val, i, &element);
     }
-
   advisories_free (adv);
+
   return retc;
 }
 
