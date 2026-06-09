@@ -1,10 +1,10 @@
 use std::path::PathBuf;
 
+use crate::framework::{GetVTsError, StreamResult};
 use crate::vts::FeedHashes;
 use crate::vts::Plugin;
 use async_trait::async_trait;
 use futures::StreamExt;
-use greenbone_scanner_framework::GetVTsError;
 use scannerlib::Promise;
 use scannerlib::models::{FeedType, VTData};
 use scannerlib::notus::advisories::VulnerabilityData;
@@ -43,16 +43,14 @@ impl From<SqlitePool> for SqlPluginStorage {
 }
 
 impl PluginFetcher for SqlPluginStorage {
-    fn get_oids(&self) -> greenbone_scanner_framework::StreamResult<String, WorkerError> {
+    fn get_oids(&self) -> StreamResult<String, WorkerError> {
         let result = query("SELECT oid FROM plugins ORDER BY oid")
             .fetch(&self.pool)
             .map(|row| row.map(|e| e.get("oid")).map_err(WorkerError::Cache));
         Box::pin(result)
     }
 
-    fn get_vts(
-        &self,
-    ) -> greenbone_scanner_framework::StreamResult<scannerlib::models::VTData, WorkerError> {
+    fn get_vts(&self) -> StreamResult<scannerlib::models::VTData, WorkerError> {
         let result = query("SELECT feed_type, json_blob FROM plugins")
             .fetch(&self.pool)
             .map(|row| {
@@ -183,12 +181,7 @@ impl orchestrator::Worker for FeedSynchronizer {
                 None
             }
         };
-        let feed_integrity_check = self.signature_check;
-
         Box::pin(async move {
-            if !feed_integrity_check {
-                return Ok(None);
-            }
             let rofl = (
                 transform(fetched.next().await),
                 transform(fetched.next().await),
@@ -254,8 +247,8 @@ mod tests {
     use std::sync::{Arc, RwLock};
 
     use crate::container_image_scanner::endpoints::vts::VTEndpoints;
-    use greenbone_scanner_framework::models::FeedState;
-    use greenbone_scanner_framework::{GetVTsError, GetVts};
+    use crate::framework::GetVTsError;
+    use scannerlib::models::FeedState;
 
     use crate::setup_sqlite;
 
@@ -292,11 +285,10 @@ mod tests {
     async fn get_oids() -> crate::Result<()> {
         let (config, pool) = create_pool().await?;
         let feed_state = Arc::new(RwLock::new(FeedState::default()));
-        let endpoint = VTEndpoints::new(
-            SqlPluginStorage::from(pool.clone()),
-            feed_state.clone(),
-            None,
-        );
+        let endpoint = VTEndpoints {
+            fetcher: Box::new(SqlPluginStorage::from(pool.clone())),
+            feed_state: feed_state.clone(),
+        };
         let synchronizer = FeedSynchronizer::new(pool.clone(), &config);
 
         let oids = endpoint.get_oids("moep".into()).collect::<Vec<_>>().await;

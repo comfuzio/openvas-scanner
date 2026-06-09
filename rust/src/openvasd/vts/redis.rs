@@ -1,7 +1,7 @@
 use std::{path::PathBuf, task::Poll};
 
+use crate::framework::{GetVTsError, StreamResult};
 use futures::Stream;
-use greenbone_scanner_framework::GetVTsError;
 use scannerlib::{
     models::{FeedType, VTData},
     openvas::cmd,
@@ -256,13 +256,11 @@ impl Stream for RedisVTDataStream {
 }
 
 impl PluginFetcher for RedisPluginHandler {
-    fn get_oids(&self) -> greenbone_scanner_framework::StreamResult<String, WorkerError> {
+    fn get_oids(&self) -> StreamResult<String, WorkerError> {
         Box::pin(RedisOidStream::from(self.address.clone()))
     }
 
-    fn get_vts(
-        &self,
-    ) -> greenbone_scanner_framework::StreamResult<scannerlib::models::VTData, WorkerError> {
+    fn get_vts(&self) -> StreamResult<scannerlib::models::VTData, WorkerError> {
         Box::pin(RedisVTDataStream::from(self.address.clone()))
     }
 }
@@ -324,11 +322,7 @@ impl orchestrator::Worker for FeedSynchronizer {
                 .map_err(redis_error_to_worker_error)?;
             Ok(ck.pop())
         };
-        let feed_integrity_check = self.signature_check;
         Box::pin(async move {
-            if !feed_integrity_check {
-                return Ok(None);
-            }
             tokio::task::spawn_blocking(move || {
                 let vtc = feed_version(&address, FeedType::NASL)?;
                 let nc = feed_version(&address, FeedType::Advisories)?;

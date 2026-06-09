@@ -1,36 +1,19 @@
-use futures::StreamExt;
-use greenbone_scanner_framework::InternalIdentifier;
-use scannerlib::{
-    SQLITE_LIMIT_VARIABLE_NUMBER,
-    models::{self, AliveTestMethods},
-};
-use sqlx::{
-    Connection, QueryBuilder, Row, Sqlite, SqlitePool, query, query_scalar, sqlite::SqliteRow,
-};
+use scannerlib::models::{self, AliveTestMethods};
+use sqlx::{Connection, Row, Sqlite, query, query_scalar, sqlite::SqliteRow};
 
 use crate::{
-    crypt::{self, Crypt, Encrypted},
+    credentials::{decrypt_credentials, encrypt_credentials},
+    crypt::Crypt,
     database::{
-        dao::{DAOError, DAOHandler, DAOPromiseRef, DAOStreamer, Execute, Fetch, StreamFetch},
-        sqlite::{DataBase, OpenVASDDB, state_change},
+        dao::{DAOError, DAOPromiseRef, Execute, Fetch},
+        sqlite::{
+            DataBase, OpenVASDDB, insert_client_scan_map, insert_scan_with_auth_data,
+            insert_values_chunked, state_change,
+        },
     },
 };
 
 pub type ScanDB<'o, T> = OpenVASDDB<'o, T>;
-
-impl From<crypt::ParseError> for DAOError {
-    fn from(value: crypt::ParseError) -> Self {
-        tracing::warn!(%value, "Unable to handle encryption on credentials.");
-        Self::Corrupt
-    }
-}
-
-impl From<serde_json::Error> for DAOError {
-    fn from(value: serde_json::Error) -> Self {
-        tracing::warn!(%value, "Invalid json stored.");
-        Self::Corrupt
-    }
-}
 
 impl<'o, C> Execute<String> for ScanDB<'o, (&'o C, &'o str, &models::Scan)>
 where
@@ -54,149 +37,139 @@ async fn scan_insert<C>(
     scan: &models::Scan,
 ) -> Result<String, DAOError>
 where
-    C: Crypt,
+    C: Crypt + Sync,
 {
     let mut conn = pool.acquire().await?;
     let mut tx = conn.begin().await?;
 
-    let row = query("INSERT INTO client_scan_map(client_id, scan_id) VALUES (?, ?)")
-        .bind(client.to_string())
-        .bind(&scan.scan_id)
-        .execute(&mut *tx)
-        .await?;
-
-    let mapped_id = row.last_insert_rowid().to_string();
-    let auth_data = {
-        let bytes = serde_json::to_vec(&scan.target.credentials)?;
-        let bytes = crypter.encrypt(bytes).await;
-        bytes.to_string()
-    };
-    query("INSERT INTO scans (id, auth_data) VALUES (?, ?)")
-        .bind(&mapped_id)
-        .bind(auth_data)
-        .execute(&mut *tx)
-        .await?;
+    let mapped_id = insert_client_scan_map(&mut *tx, client, &scan.scan_id).await?;
+    let auth_data = encrypt_credentials(crypter, &scan.target.credentials).await?;
+    insert_scan_with_auth_data(&mut *tx, mapped_id, &auth_data).await?;
+    let mapped_id = mapped_id.to_string();
     if !scan.vts.is_empty() {
-        for vts in scan.vts.chunks(SQLITE_LIMIT_VARIABLE_NUMBER / 2) {
-            let mut builder = QueryBuilder::new("INSERT OR REPLACE INTO vts (id, vt)");
-            builder.push_values(vts, |mut b, vt| {
+        insert_values_chunked(
+            &mut *tx,
+            "INSERT OR REPLACE INTO vts (id, vt)",
+            |mut b, vt| {
                 b.push_bind(&mapped_id).push_bind(&vt.oid);
-            });
-            let query = builder.build();
-            query.execute(&mut *tx).await?;
-        }
+            },
+            &scan.vts,
+            2,
+        )
+        .await?;
         let vt_params = scan
             .vts
             .iter()
             .flat_map(|x| x.parameters.iter().map(move |p| (&x.oid, p.id, &p.value)))
             .collect::<Vec<_>>();
-        if !vt_params.is_empty() {
-            for vt_params in vt_params.chunks(SQLITE_LIMIT_VARIABLE_NUMBER / 3) {
-                let mut builder =
-                    QueryBuilder::new("INSERT INTO vt_parameters (id, vt, param_id, param_value)");
-
-                builder.push_values(vt_params, |mut b, (oid, param_id, param_value)| {
-                    b.push_bind(&mapped_id)
-                        .push_bind(oid)
-                        .push_bind(*param_id as i64)
-                        .push_bind(param_value);
-                });
-                let query = builder.build();
-                query.execute(&mut *tx).await?;
-            }
-        }
+        insert_values_chunked(
+            &mut *tx,
+            "INSERT INTO vt_parameters (id, vt, param_id, param_value)",
+            |mut b, (oid, param_id, param_value)| {
+                b.push_bind(&mapped_id)
+                    .push_bind(oid)
+                    .push_bind(*param_id as i64)
+                    .push_bind(param_value);
+            },
+            &vt_params,
+            4,
+        )
+        .await?;
     }
 
-    if !scan.target.hosts.is_empty() {
-        let mut builder = QueryBuilder::new("INSERT INTO hosts (id, host)");
-        builder.push_values(&scan.target.hosts, |mut b, host| {
+    insert_values_chunked(
+        &mut *tx,
+        "INSERT INTO hosts (id, host)",
+        |mut b, host| {
             b.push_bind(&mapped_id).push_bind(host);
-        });
-        let query = builder.build();
-        query.execute(&mut *tx).await?;
-    }
+        },
+        &scan.target.hosts,
+        2,
+    )
+    .await?;
 
-    if !scan.target.excluded_hosts.is_empty() {
-        let mut builder = QueryBuilder::new(
-            "INSERT INTO resolved_hosts (id, original_host, resolved_host, kind, scan_status)",
-        );
-        builder.push_values(&scan.target.excluded_hosts, |mut b, host| {
+    insert_values_chunked(
+        &mut *tx,
+        "INSERT INTO resolved_hosts (id, original_host, resolved_host, kind, scan_status)",
+        |mut b, host| {
             //TODO: check host if ip v4, v6, dns or oci ... for now it doesn't matter.
             b.push_bind(&mapped_id)
                 .push_bind(host.clone())
                 .push_bind(host)
                 .push_bind("dns")
                 .push_bind("excluded");
-        });
-        let query = builder.build();
-        query.execute(&mut *tx).await?;
-    }
+        },
+        &scan.target.excluded_hosts,
+        5,
+    )
+    .await?;
 
-    if !scan.target.ports.is_empty() {
-        for ports in scan.target.ports.chunks(SQLITE_LIMIT_VARIABLE_NUMBER / 4) {
-            let mut builder = QueryBuilder::new("INSERT INTO ports (id, protocol, start, end) ");
-            builder.push_values(
-                ports.iter().flat_map(|port| {
-                    port.range
-                        .clone()
-                        .into_iter()
-                        .map(move |r| (port.protocol.as_ref(), r))
-                }),
-                |mut b, (protocol, range)| {
-                    b.push_bind(&mapped_id)
-                        .push_bind(match protocol {
-                            None => "udp_tcp",
-                            Some(x) => x.as_ref(),
-                        })
-                        .push_bind(range.start as i64)
-                        .push_bind(range.end.map(|x| x as i64));
-                },
-            );
-            let query = builder.build();
+    let ports = scan
+        .target
+        .ports
+        .iter()
+        .flat_map(|port| {
+            port.range
+                .clone()
+                .into_iter()
+                .map(move |r| (port.protocol.as_ref(), r))
+        })
+        .collect::<Vec<_>>();
+    insert_values_chunked(
+        &mut *tx,
+        "INSERT INTO ports (id, protocol, start, end)",
+        |mut b, (protocol, range)| {
+            b.push_bind(&mapped_id)
+                .push_bind(match protocol {
+                    None => "udp_tcp",
+                    Some(x) => x.as_ref(),
+                })
+                .push_bind(range.start as i64)
+                .push_bind(range.end.map(|x| x as i64));
+        },
+        &ports,
+        4,
+    )
+    .await?;
+    let alive_test_ports = scan
+        .target
+        .alive_test_ports
+        .iter()
+        .flat_map(|port| {
+            port.range
+                .clone()
+                .into_iter()
+                .map(move |r| (port.protocol.as_ref(), r))
+        })
+        .collect::<Vec<_>>();
+    insert_values_chunked(
+        &mut *tx,
+        "INSERT INTO ports (id, protocol, start, end, alive)",
+        |mut b, (protocol, range)| {
+            b.push_bind(&mapped_id)
+                .push_bind(match protocol {
+                    None => "udp_tcp",
+                    Some(x) => x.as_ref(),
+                })
+                .push_bind(range.start as i64)
+                .push_bind(range.end.map(|x| x as i64))
+                .push_bind(true);
+        },
+        &alive_test_ports,
+        5,
+    )
+    .await?;
 
-            query.execute(&mut *tx).await?;
-        }
-    }
-    if !scan.target.alive_test_ports.is_empty() {
-        for ports in scan
-            .target
-            .alive_test_ports
-            .chunks(SQLITE_LIMIT_VARIABLE_NUMBER / 4)
-        {
-            let mut builder =
-                QueryBuilder::new("INSERT INTO ports (id, protocol, start, end, alive)");
-            builder.push_values(
-                ports.iter().flat_map(|port| {
-                    port.range
-                        .clone()
-                        .into_iter()
-                        .map(move |r| (port.protocol.as_ref(), r))
-                }),
-                |mut b, (protocol, range)| {
-                    b.push_bind(&mapped_id)
-                        .push_bind(match protocol {
-                            None => "udp_tcp",
-                            Some(x) => x.as_ref(),
-                        })
-                        .push_bind(range.start as i64)
-                        .push_bind(range.end.map(|x| x as i64))
-                        .push_bind(true);
-                },
-            );
-            let query = builder.build();
-
-            query.execute(&mut *tx).await?;
-        }
-    }
-
-    if !scan.target.alive_test_methods.is_empty() {
-        let mut builder = QueryBuilder::new("INSERT INTO alive_methods (id, method)");
-        builder.push_values(&scan.target.alive_test_methods, |mut b, method| {
+    insert_values_chunked(
+        &mut *tx,
+        "INSERT INTO alive_methods (id, method)",
+        |mut b, method| {
             b.push_bind(&mapped_id).push_bind(method.as_ref());
-        });
-        let query = builder.build();
-        query.execute(&mut *tx).await?;
-    }
+        },
+        &scan.target.alive_test_methods,
+        2,
+    )
+    .await?;
 
     let mut scan_preferences = scan.scan_preferences.clone();
     if scan.target.reverse_lookup_unify.unwrap_or_default() {
@@ -212,16 +185,18 @@ where
         });
     }
 
-    if !scan_preferences.is_empty() {
-        let mut builder = QueryBuilder::new("INSERT INTO preferences (id, key, value)");
-        builder.push_values(scan_preferences, |mut b, pref| {
+    insert_values_chunked(
+        &mut *tx,
+        "INSERT INTO preferences (id, key, value)",
+        |mut b, pref| {
             b.push_bind(&mapped_id)
-                .push_bind(pref.id)
-                .push_bind(pref.value);
-        });
-        let query = builder.build();
-        query.execute(&mut *tx).await?;
-    }
+                .push_bind(&pref.id)
+                .push_bind(&pref.value);
+        },
+        &scan_preferences,
+        3,
+    )
+    .await?;
 
     tx.commit().await?;
     Ok(scan.scan_id.clone())
@@ -356,9 +331,7 @@ where
         .await?;
 
     let auth_data = scan_row.get::<String, _>("auth_data");
-    let encrypted: Encrypted = Encrypted::try_from(auth_data)?;
-    let auth_data = crypter.decrypt(encrypted).await;
-    let credentials = serde_json::from_slice::<Vec<models::Credential>>(&auth_data)?;
+    let credentials = decrypt_credentials(crypter, &auth_data).await?;
 
     let scan = models::Scan {
         scan_id,
@@ -444,95 +417,6 @@ impl<'o> Fetch<String> for ScanDB<'o, i64> {
                 .bind(self.input)
                 .fetch_one(self.pool)
                 .await
-                .map_err(DAOError::from)
-        })
-    }
-}
-
-// match query_scalar("SELECT count(id) FROM scans WHERE status = 'running'")
-//     .fetch_one(&self.pool)
-//     .await
-// {
-//     Ok(x) => x,
-//     Err(error) => {
-//         tracing::warn!(
-//             %error,
-//             "Unable to count running scans, still preventing start of new scans"
-//         );
-//         1
-//     }
-// }
-impl<'o> Fetch<i64> for ScanDB<'o, models::Phase> {
-    fn fetch<'a, 'b>(&'a self) -> DAOPromiseRef<'b, i64>
-    where
-        'a: 'b,
-    {
-        Box::pin(async move {
-            query_scalar("SELECT count(id) FROM scans WHERE status = ?")
-                .bind(self.input.as_ref())
-                .fetch_one(self.pool)
-                .await
-                .map_err(DAOError::from)
-        })
-    }
-}
-
-impl<'o, T> Fetch<Option<InternalIdentifier>> for T
-where
-    T: DAOHandler<&'o SqlitePool, (&'o str, &'o str)> + Sync,
-{
-    fn fetch<'a, 'b>(&'a self) -> DAOPromiseRef<'b, Option<InternalIdentifier>>
-    where
-        'a: 'b,
-    {
-        Box::pin(async move {
-            let (client_id, scan) = self.input();
-            let x = query("SELECT id FROM client_scan_map WHERE client_id = ? AND scan_id = ?")
-                .bind(client_id)
-                .bind(scan)
-                .fetch_optional(self.db())
-                .await?;
-            Ok(x.map(|r| r.get::<i64, _>("id")).map(|x| x.to_string()))
-        })
-    }
-}
-
-impl<'o, T> StreamFetch<String> for T
-where
-    T: DAOHandler<&'o SqlitePool, String> + Sync,
-{
-    fn stream_fetch(self) -> DAOStreamer<String> {
-        let (db, client_id) = self.inner();
-        let result = query(
-            r#"
-                SELECT scan_id FROM client_scan_map WHERE client_id = ?
-            "#,
-        )
-        .bind(client_id)
-        .fetch(db)
-        .map(|x| {
-            x.map(|x| x.get::<String, _>("scan_id"))
-                .map_err(DAOError::from)
-        });
-        Box::pin(result)
-    }
-}
-
-impl<'o, T> Execute<()> for T
-where
-    T: DAOHandler<&'o SqlitePool, String> + Sync,
-{
-    fn exec<'a, 'b>(&'a self) -> DAOPromiseRef<'b, ()>
-    where
-        'a: 'b,
-    {
-        const DELETE_SQL: &str = "DELETE FROM client_scan_map WHERE id = ?";
-        Box::pin(async move {
-            query(DELETE_SQL)
-                .bind(self.input())
-                .execute(self.db())
-                .await
-                .map(|_| ())
                 .map_err(DAOError::from)
         })
     }
