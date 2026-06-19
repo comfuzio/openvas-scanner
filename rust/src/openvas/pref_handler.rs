@@ -4,11 +4,11 @@
 
 use std::collections::HashMap;
 
-use crate::models::{
+use crate::storage::redis::RedisStorageResult;
+use greenbone_scanner_framework::models::{
     AliveTestMethods, CredentialType, PreferenceValue, Scan, ScanPreferenceInformation, Service,
     VT, ports_to_openvas_port_list,
 };
-use crate::storage::redis::RedisStorageResult;
 
 use super::cmd;
 use super::openvas_redis::{KbAccess, VtHelper};
@@ -99,7 +99,7 @@ where
         let mut pref_list: HashMap<String, String> = HashMap::new();
 
         for vt in vts {
-            let nvt_opt = match self.redis_connector.get_vt(&vt.oid) {
+            let nvt_opt = match self.redis_connector.get_nasl_vt(&vt.oid) {
                 Ok(nvt) => nvt,
                 Err(e) => {
                     tracing::warn!(
@@ -573,7 +573,7 @@ where
 mod tests {
     use std::collections::HashMap;
 
-    use crate::models::{
+    use greenbone_scanner_framework::models::{
         self, AliveTestMethods, Credential, CredentialType, Port, PortRange, Protocol, Scan,
         Service,
     };
