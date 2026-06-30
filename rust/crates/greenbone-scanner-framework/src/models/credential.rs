@@ -52,14 +52,14 @@ pub enum Service {
     /// SNMP, supports [SNMP](CredentialType::SNMP)
     SNMP,
     #[serde(rename = "krb5")]
-    /// SNMP, supports [SNMP](CredentialType::SNMP)
+    /// KRB5, supports [KRB5](CredentialType::KRB5)
     KRB5,
     #[serde(rename = "generic")]
     Generic,
 }
 
-impl AsRef<str> for Service {
-    fn as_ref(&self) -> &str {
+impl Service {
+    pub fn to_str(&self) -> &str {
         match self {
             Service::SSH => "ssh",
             Service::SMB => "smb",
@@ -68,6 +68,12 @@ impl AsRef<str> for Service {
             Service::KRB5 => "krb5",
             Service::Generic => "generic",
         }
+    }
+}
+
+impl std::fmt::Display for Service {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.to_str())
     }
 }
 
@@ -133,6 +139,8 @@ pub enum CredentialType {
         /// The SNMP privacy algorithm.
         privacy_algorithm: String,
     },
+    #[serde(rename = "krb5")]
+    /// KRB5 credentials.
     KRB5 {
         username: String,
         password: String,
@@ -141,14 +149,20 @@ pub enum CredentialType {
     },
 }
 
-impl AsRef<str> for CredentialType {
-    fn as_ref(&self) -> &str {
+impl CredentialType {
+    pub fn to_str(&self) -> &str {
         match self {
             CredentialType::UP { .. } => "up",
             CredentialType::USK { .. } => "usk",
             CredentialType::SNMP { .. } => "snmp",
             CredentialType::KRB5 { .. } => "krb5",
         }
+    }
+}
+
+impl std::fmt::Display for CredentialType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.to_str())
     }
 }
 
