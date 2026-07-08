@@ -6,13 +6,10 @@ use tokio::sync::RwLock;
 use greenbone_scanner_framework::models::{self, Scan};
 use scannerlib::{
     models::FeedType,
-    nasl::{builtin::nasl_std_functions, syntax::Loader},
+    nasl::{builtin::nasl_std_executor, syntax::Loader},
     openvas::{self, cmd},
     osp,
-    scanner::{
-        OpenvasdScanner, ScanDeleter, ScanResultFetcher, ScanResultKind, ScanStarter, ScanStopper,
-        TypeOfScanner, preferences,
-    },
+    scanner::{OpenvasdScanner, ScanResultKind, Scanner, preferences},
     utils::scanner_types::{self, ScannerType},
 };
 
@@ -129,6 +126,25 @@ pub enum Message {
 // maybe we should just use AnyHow
 type R<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
+#[derive(Debug, thiserror::Error)]
+enum LockFileError {
+    #[error("Unable to open feed update lock file {path}: {source}")]
+    Open {
+        path: String,
+        source: std::io::Error,
+    },
+    #[error("Unable to check feed update lock file {path}: {source}")]
+    TryLock {
+        path: String,
+        source: std::io::Error,
+    },
+    #[error("Unable to unlock feed update lock file {path}: {source}")]
+    Unlock {
+        path: String,
+        source: std::io::Error,
+    },
+}
+
 impl<T, C> ScanScheduler<T, C> {
     /// Should be called on restart if the application crashed while there were running scans.
     ///
@@ -181,28 +197,28 @@ impl<T, C> ScanScheduler<T, C> {
     }
 }
 
-fn is_file_locked(path: String) -> bool {
-    let mut file = LockFile::open(&path).expect("Invalid path to lock file");
+fn is_file_locked(path: String) -> R<bool> {
+    let mut file = LockFile::open(&path).map_err(|source| LockFileError::Open {
+        path: path.clone(),
+        source,
+    })?;
 
-    if file.try_lock().expect("already locked by this process") {
-        file.unlock().expect("unlocking not locked file");
-        false
+    if file.try_lock().map_err(|source| LockFileError::TryLock {
+        path: path.clone(),
+        source,
+    })? {
+        file.unlock()
+            .map_err(|source| LockFileError::Unlock { path, source })?;
+        Ok(false)
     } else {
-        //locked by another process
-        true
+        // locked by another process
+        Ok(true)
     }
 }
 
-impl<Scanner, C> ScanScheduler<Scanner, C>
+impl<SC, C> ScanScheduler<SC, C>
 where
-    Scanner: TypeOfScanner
-        + ScanStarter
-        + ScanStopper
-        + ScanDeleter
-        + ScanResultFetcher
-        + Send
-        + Sync
-        + 'static,
+    SC: Scanner + Send + Sync + 'static,
     C: Crypt + Send + Sync + 'static,
 {
     async fn scan_start(&self, id: i64, scan: Scan) {
@@ -386,7 +402,7 @@ where
                 let is_file_locked = {
                     let mut lockfile = PathBuf::from(self.lock_file_dir.clone());
                     lockfile.push(LOCK_FILE);
-                    is_file_locked(lockfile.to_string_lossy().to_string())
+                    is_file_locked(lockfile.to_string_lossy().to_string())?
                 };
                 if self.scan_type() == ScannerType::Openvas && !is_file_locked {
                     Some(self.feed_sync_in_progress.write().await.approve())
@@ -438,7 +454,7 @@ where
             let filelocked = {
                 let mut lockfile = PathBuf::from(self.lock_file_dir.clone());
                 lockfile.push(LOCK_FILE);
-                is_file_locked(lockfile.to_string_lossy().to_string())
+                is_file_locked(lockfile.to_string_lossy().to_string())?
             };
             if count_running == 0 || (self.scan_type() == ScannerType::Openvas && !filelocked) {
                 return Ok(self.need_to_allow().await);
@@ -461,14 +477,7 @@ async fn run_scheduler<S, E>(
     feed: orchestrator::Communicator,
 ) -> R<mpsc::Sender<Message>>
 where
-    S: TypeOfScanner
-        + ScanStarter
-        + ScanStopper
-        + ScanDeleter
-        + ScanResultFetcher
-        + Send
-        + Sync
-        + 'static,
+    S: Scanner + Send + Sync + 'static,
     E: Crypt + Send + Sync + 'static,
 {
     // happens when openvasd was killed when scans did still run
@@ -486,17 +495,19 @@ where
         let send_allow = async |msgs: Vec<orchestrator::Allow>| {
             for msg in msgs {
                 tracing::debug!(feed_type=?msg, "Sending feed sync allow.");
-                if let Err(error) = feed.approve(msg).await {
-                    tracing::warn!(%error, "Unable to send allow message to orchestrator");
-                }
+                feed.approve(msg).await?;
             }
+            Ok::<(), orchestrator::CommunicationIssues>(())
         };
         loop {
             tokio::select! {
                 Some(msg) = feed.receive_state_changes() => {
                     match scheduler.on_feed_action(&msg).await {
                         Ok(Some(msg)) => {
-                            send_allow(msg).await;
+                            if let Err(error) = send_allow(msg).await {
+                                tracing::warn!(%error, "Unable to send allow message to orchestrator");
+                                break;
+                            }
                         }
                         Ok(None) => {},
                         Err(error) =>  tracing::warn!(?msg, %error, "Unable to react on feed message"),
@@ -516,7 +527,10 @@ where
                     match scheduler.on_schedule().await {
                         Err(error) => tracing::warn!(%error, "Unable to schedule"),
                         Ok(msgs) => {
-                                send_allow(msgs).await;
+                            if let Err(error) = send_allow(msgs).await {
+                                tracing::warn!(%error, "Unable to send allow message to orchestrator");
+                                break;
+                            }
                         }
 
                     }
@@ -542,14 +556,7 @@ pub(super) async fn init_with_scanner<E, S>(
     feed: orchestrator::Communicator,
 ) -> R<Sender<Message>>
 where
-    S: TypeOfScanner
-        + ScanStarter
-        + ScanStopper
-        + ScanDeleter
-        + ScanResultFetcher
-        + Send
-        + Sync
-        + 'static,
+    S: Scanner + Send + Sync + 'static,
     E: Crypt + Send + Sync + 'static,
 {
     let change_scan_status = ScanStateController::init(pool.clone()).await?;
@@ -560,13 +567,7 @@ where
         scanner: Arc::new(scanner),
         feed_sync_in_progress: Arc::new(RwLock::new(IsInProgress::default())),
         scan_state: change_scan_status,
-        lock_file_dir: config
-            .feed
-            .lock_file_dir
-            .clone()
-            .unwrap_or(PathBuf::from("/var/lib/openvas"))
-            .to_string_lossy()
-            .to_string(),
+        lock_file_dir: config.feed.lock_file_dir().to_string_lossy().to_string(),
     };
 
     run_scheduler(config.scheduler.check_interval, scheduler, feed).await
@@ -592,7 +593,7 @@ where
                     config.scanner.ospd.socket.display()
                 );
             }
-            let scanner = osp::Scanner::new(
+            let scanner = osp::OspScanner::new(
                 config.scanner.ospd.socket.clone(),
                 config.scanner.ospd.read_timeout,
             );
@@ -601,7 +602,7 @@ where
         scanner_types::ScannerType::Openvas => {
             let redis_url = cmd::get_redis_socket();
 
-            let scanner = openvas::Scanner::new(
+            let scanner = openvas::OpenvasScanner::new(
                 config.scheduler.min_free_mem,
                 None, // cpu_option are not available currently
                 cmd::check_sudo(),
@@ -613,7 +614,7 @@ where
         }
         scanner_types::ScannerType::Openvasd => {
             let loader = Loader::from_feed_path(&config.feed.path);
-            let executor = nasl_std_functions();
+            let executor = nasl_std_executor();
             let notus = config
                 .notus
                 .address
@@ -630,7 +631,7 @@ where
 pub(crate) mod tests {
     use scannerlib::{
         models::Status,
-        scanner::{self, LambdaBuilder, ScanResults},
+        scanner::{self, ScanResults, TestScannerBuilder},
     };
     use sqlx::query_scalar;
 
@@ -644,20 +645,20 @@ pub(crate) mod tests {
     };
     type TR = R<()>;
 
-    async fn setup_test_env() -> R<(ScanScheduler<scanner::Lambda, ChaCha20Crypt>, Vec<i64>)> {
-        setup_test_env_with_scanner(LambdaBuilder::default()).await
+    async fn setup_test_env() -> R<(ScanScheduler<scanner::TestScanner, ChaCha20Crypt>, Vec<i64>)> {
+        setup_test_env_with_scanner(TestScannerBuilder::default()).await
     }
 
     async fn setup_test_env_with_scanner(
-        builder: LambdaBuilder,
-    ) -> R<(ScanScheduler<scanner::Lambda, ChaCha20Crypt>, Vec<i64>)> {
+        builder: TestScannerBuilder,
+    ) -> R<(ScanScheduler<scanner::TestScanner, ChaCha20Crypt>, Vec<i64>)> {
         setup_test_env_with_scanner_and_feed_messages(builder, Default::default()).await
     }
 
     async fn setup_test_env_with_scanner_and_feed_messages(
-        builder: LambdaBuilder,
+        builder: TestScannerBuilder,
         feed_changes: IsInProgress,
-    ) -> R<(ScanScheduler<scanner::Lambda, ChaCha20Crypt>, Vec<i64>)> {
+    ) -> R<(ScanScheduler<scanner::TestScanner, ChaCha20Crypt>, Vec<i64>)> {
         let (config, pool) = create_pool().await?;
         let scanner = Arc::new(builder.build());
         let cryptor = Arc::new(scans::config_to_crypt(&config));
@@ -727,8 +728,8 @@ pub(crate) mod tests {
         Ok(())
     }
 
-    pub(crate) fn scanner_succeeded() -> LambdaBuilder {
-        LambdaBuilder::new().with_fetch(|id| {
+    pub(crate) fn scanner_succeeded() -> TestScannerBuilder {
+        TestScannerBuilder::new().with_fetch(|id| {
             let results = vec![
                 models::Result {
                     id: 0,
@@ -812,7 +813,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn run_scans_failure() -> TR {
         let (under_test, known_scans) = setup_test_env_with_scanner(
-            LambdaBuilder::new()
+            TestScannerBuilder::new()
                 .with_start(|_| Err(scanner::Error::Connection("nada".to_string()))),
         )
         .await?;
@@ -847,7 +848,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn do_not_start_when_scanner_cannot_start_scan() -> TR {
         let (under_test, known_scans) =
-            setup_test_env_with_scanner(LambdaBuilder::new().with_can_start(|| false)).await?;
+            setup_test_env_with_scanner(TestScannerBuilder::new().with_can_start(|| false)).await?;
 
         for id in known_scans.iter() {
             under_test
@@ -873,7 +874,7 @@ pub(crate) mod tests {
             ..Default::default()
         };
         let (under_test, known_scans) =
-            setup_test_env_with_scanner_and_feed_messages(LambdaBuilder::new(), iip).await?;
+            setup_test_env_with_scanner_and_feed_messages(TestScannerBuilder::new(), iip).await?;
 
         for id in known_scans.iter() {
             under_test
