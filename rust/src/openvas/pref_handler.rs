@@ -4,11 +4,11 @@
 
 use std::collections::HashMap;
 
-use crate::storage::redis::RedisStorageResult;
-use greenbone_scanner_framework::models::{
+use crate::models::{
     AliveTestMethods, CredentialType, PreferenceValue, Scan, ScanPreferenceInformation, Service,
     VT, ports_to_openvas_port_list,
 };
+use crate::storage::redis::RedisStorageResult;
 
 use super::cmd;
 use super::openvas_redis::{KbAccess, VtHelper};
@@ -266,7 +266,7 @@ where
     async fn prepare_boreas_alive_test(&mut self) -> RedisStorageResult<()> {
         // Check "test_alive_hosts_only" configuration from openvas.conf
         // If set no, boreas is disabled and alive_host.nasl is used instead.
-        if let Ok(config) = cmd::read_openvas_config()
+        if let Ok(config) = cmd::read_openvas_config().await
             && let Some(setting) = config.get("default", "test_alive_hosts_only")
             && setting == "no"
         {
@@ -573,7 +573,7 @@ where
 mod tests {
     use std::collections::HashMap;
 
-    use greenbone_scanner_framework::models::{
+    use crate::models::{
         self, AliveTestMethods, Credential, CredentialType, Port, PortRange, Protocol, Scan,
         Service,
     };

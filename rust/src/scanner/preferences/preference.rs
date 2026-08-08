@@ -2,9 +2,7 @@
 //
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-use greenbone_scanner_framework::models::{
-    PreferenceValue, ScanPreference, ScanPreferenceInformation,
-};
+use crate::models::{PreferenceValue, ScanPreference, ScanPreferenceInformation};
 use lazy_static::lazy_static;
 use serde::{Deserialize, Serialize};
 
@@ -264,9 +262,6 @@ impl Default for ScanPrefValue {
         Self::Int(0)
     }
 }
-
-#[derive(Default, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct FullScanPreferences(Vec<FullScanPreference>);
 
 /// Configuration preference information for a scan. The type can be derived from the default value.
 #[derive(Default, Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

@@ -9,9 +9,7 @@ use std::{
     fmt::{Debug, Display},
 };
 
-pub use greenbone_scanner_framework::models::{
-    ACT, NvtPreference, NvtRef, TagKey, TagValue, VTData,
-};
+pub use crate::models::{ACT, NvtPreference, NvtRef, TagKey, TagValue, VTData};
 
 use crate::notus::advisories::{Vulnerability, VulnerabilityData};
 
@@ -127,20 +125,12 @@ pub struct Feed;
 #[serde(transparent)]
 /// Structure to hold a VT
 pub struct Nvt {
-    pub data: greenbone_scanner_framework::models::VTData,
+    pub data: VTData,
 }
 
 impl Display for Nvt {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.data)
-    }
-}
-
-impl Nvt {
-    /// Returns Err with the feed_version if it is a version Ok otherwise
-    /// // TODO: delete
-    pub fn set_from_field(&mut self, field: NvtField) {
-        field.move_to_data(&mut self.data);
     }
 }
 

@@ -7,11 +7,12 @@ use std::{
     sync::Arc,
 };
 
-use greenbone_scanner_framework::{GetVTsError, StreamResult};
+use crate::greenbone_scanner_framework::{GetVTsError, StreamResult};
 use scannerlib::Promise;
 use scannerlib::feed::{HashSumFileItem, HashSumNameLoader, check_signature};
 use scannerlib::nasl::syntax::Loader;
 use scannerlib::notus::advisory_loader;
+use scannerlib::openvas::cmd::{get_plugins_folder, get_redis_socket};
 use scannerlib::{
     models::{FeedState, FeedType, VTData},
     notus::advisories::VulnerabilityData,
@@ -131,12 +132,16 @@ pub async fn init(
 ) -> (orchestrator::Communicator, Endpoints) {
     match config.scanner.scanner_type {
         ScannerType::Openvas => {
-            let fetcher = redis::RedisPluginHandler::from(config);
-            let worker = redis::FeedSynchronizer::from(config);
+            let socket = get_redis_socket().await;
+            let plugin_folder = get_plugins_folder().await;
+            let fetcher = redis::RedisPluginHandler::new(socket.clone(), plugin_folder);
+            let worker = redis::FeedSynchronizer::new(config, socket);
             _init(config, fetcher, worker, snapshot).await
         }
         ScannerType::Ospd => {
-            let fetcher = redis::RedisPluginHandler::from(config);
+            let socket = get_redis_socket().await;
+            let plugins_folder = get_plugins_folder().await;
+            let fetcher = redis::RedisPluginHandler::new(socket, plugins_folder);
             let worker = crate::database::sqlite::vts::FeedSynchronizer::new(pool, config);
             _init(config, fetcher, worker, snapshot).await
         }
@@ -152,10 +157,17 @@ pub async fn init(
 }
 
 pub trait PluginStorer {
+    fn prepare_feed(&self, hash: &FeedHash) -> Promise<Result<(), WorkerError>>;
     fn store_hash(&self, hash: &FeedHash) -> Promise<Result<(), WorkerError>>;
     fn store_plugin<T>(&self, hash: &FeedHash, plugin: T) -> Promise<Result<(), WorkerError>>
     where
         T: Plugin + Send + Sync + 'static;
+}
+
+pub(crate) fn pending_hash(hash: &FeedHash) -> FeedHash {
+    let mut pending = hash.clone();
+    pending.hash.clear();
+    pending
 }
 
 async fn synchronize_json<F, T, PS>(ps: &PS, hash: &FeedHash, f: F) -> Result<(), WorkerError>
@@ -206,12 +218,18 @@ where
     match feed_hash.typus {
         FeedType::Products => tracing::debug!(?feed_hash.typus, "Not supported, ignoring."),
         FeedType::Advisories => {
+            let path = feed_hash.path.clone();
+            let hash = feed_hash.hash.clone();
+            ps.prepare_feed(&feed_hash).await?;
+            synchronize_advisories(ps, path, hash, signature_check).await?;
             ps.store_hash(&feed_hash).await?;
-            synchronize_advisories(ps, feed_hash.path, feed_hash.hash, signature_check).await?
         }
         FeedType::NASL => {
+            let path = feed_hash.path.clone();
+            let hash = feed_hash.hash.clone();
+            ps.prepare_feed(&feed_hash).await?;
+            synchronize_plugins(ps, path, hash, signature_check).await?;
             ps.store_hash(&feed_hash).await?;
-            synchronize_plugins(ps, feed_hash.path, feed_hash.hash, signature_check).await?
         }
     };
     Ok(())
@@ -393,6 +411,7 @@ fn verify_signature_and_send(
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 struct VTDataMessage {
+    #[serde(flatten)]
     item: VTData,
     hashsum: String,
 }

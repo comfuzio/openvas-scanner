@@ -5,19 +5,18 @@
 //! This module contains traits and implementations for scheduling a scan.
 mod wave;
 
-use std::{collections::HashMap, fmt::Display, io::Write, sync::Arc};
+use std::{collections::HashMap, fmt::Display, sync::Arc};
 
 use crate::storage::{
     Retriever,
     error::StorageError,
     inmemory::InMemoryStorage,
     items::nvt::{ACT, FileName, Oid},
-    json::JsonStorage,
-    redis::{RedisAddAdvisory, RedisAddNvt, RedisGetNvt, RedisStorage, RedisWrapper},
+    redis::RedisStorage,
 };
 
-use greenbone_scanner_framework::models::VTData;
-use greenbone_scanner_framework::models::{Parameter, VT};
+use crate::models::{Parameter, VT, VTData};
+
 use thiserror::Error;
 
 use wave::WaveExecutionPlan;
@@ -98,11 +97,7 @@ pub trait SchedulerStorage:
 }
 
 impl SchedulerStorage for InMemoryStorage {}
-impl<T: Write + Send> SchedulerStorage for JsonStorage<T> {}
-impl<T> SchedulerStorage for RedisStorage<T> where
-    T: RedisWrapper + RedisAddNvt + RedisAddAdvisory + RedisGetNvt + Send
-{
-}
+impl SchedulerStorage for RedisStorage {}
 impl<T: SchedulerStorage> SchedulerStorage for Arc<T> where Arc<T>: Sync {}
 
 pub struct Scheduler<S> {
@@ -211,15 +206,14 @@ where
 
 #[cfg(test)]
 mod tests {
-    use greenbone_scanner_framework::models::VT;
 
+    use crate::models::{VT, VTData};
     use crate::scanner::Scan;
     use crate::scheduling::Scheduler;
     use crate::scheduling::Stage;
     use crate::storage::Dispatcher;
     use crate::storage::inmemory::InMemoryStorage;
     use crate::storage::items::nvt::FileName;
-    use greenbone_scanner_framework::models::VTData;
 
     #[tokio::test]
     #[tracing_test::traced_test]

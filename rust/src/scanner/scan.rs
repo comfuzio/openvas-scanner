@@ -1,7 +1,7 @@
 use tracing::error;
 
+use crate::models::{self, AliveTestMethods, Port, VT};
 use crate::nasl::utils::scan_ctx::{Ports, Target};
-use greenbone_scanner_framework::models::{self, AliveTestMethods, Port, VT};
 
 use super::preferences::preference::ScanPrefs;
 
@@ -13,6 +13,7 @@ pub struct Scan {
     pub vts: Vec<VT>,
     pub scan_preferences: ScanPrefs,
     pub alive_test_methods: Vec<AliveTestMethods>,
+    #[allow(unused)]
     pub alive_test_ports: Vec<Port>,
 }
 

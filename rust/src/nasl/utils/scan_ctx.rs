@@ -4,8 +4,8 @@
 
 //! Defines the context used within the interpreter and utilized by the builtin functions
 
+use crate::models::{AliveTestMethods, Port, Protocol, ScanPreference};
 use async_trait::async_trait;
-use greenbone_scanner_framework::models::{AliveTestMethods, Port, Protocol, ScanPreference};
 use rand::seq::IndexedRandom;
 use tokio::sync::RwLock;
 
@@ -23,7 +23,7 @@ use crate::storage::items::result::{ResultContextKeySingle, ResultItem};
 use crate::storage::{self, ScanID};
 use crate::storage::{Dispatcher, Remover, Retriever};
 //TODO: rename
-use greenbone_scanner_framework::models::VTData;
+use crate::models::VTData;
 use std::collections::BTreeSet;
 use std::sync::{Arc, MutexGuard};
 
@@ -31,7 +31,7 @@ use super::error::ReturnBehavior;
 use super::executor::Executor;
 use super::hosts::{LOCALHOST, resolve_hostname};
 use super::{FnError, Register};
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -274,7 +274,9 @@ impl<T> ContextStorage for T where
 #[derive(Clone)]
 pub enum NotusCtx {
     Direct(Arc<Mutex<Notus>>),
-    Address(SocketAddr),
+    /// The URL to the Notus endpoint of a Skiron service
+    ///(e.g. `http://127.0.0.1:8085/skiron/v2/api/scanNotus`).
+    Address(url::Url),
 }
 
 /// NASL execution context.
@@ -667,7 +669,6 @@ impl Drop for ScanCtx<'_> {
 pub struct JmpDesc {
     pub in_addr: Option<IpAddr>,
     pub count: usize,
-    pub socket: Option<socket2::Socket>,
 }
 
 #[derive(Default)]

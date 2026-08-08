@@ -3,19 +3,24 @@
 // SPDX-License-Identifier: GPL-2.0-or-later WITH x11vnc-openssl-exception
 
 pub mod update;
-use std::{io, path::PathBuf};
+use std::{
+    io,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 // re-export to work around name conflict
 
 use clap::Subcommand;
 use scannerlib::{
+    models::VTData,
     nasl::syntax::LoadError,
     storage::{
+        Retriever,
         error::StorageError,
-        json::{ArrayWrapper, JsonStorage},
-        redis::{
-            FEEDUPDATE_SELECTOR, NOTUSUPDATE_SELECTOR, NameSpaceSelector, RedisCtx, RedisStorage,
-        },
+        inmemory::InMemoryStorage,
+        items::nvt::Feed,
+        redis::{FEEDUPDATE_SELECTOR, NOTUSUPDATE_SELECTOR, NameSpaceSelector, RedisStorage},
     },
 };
 use tracing::warn;
@@ -71,7 +76,7 @@ struct TransformArgs {
 fn make_redis_storage(
     redis: &str,
     selector: &[NameSpaceSelector],
-) -> Result<RedisStorage<RedisCtx>, CliErrorKind> {
+) -> Result<RedisStorage, CliErrorKind> {
     Ok(RedisStorage::init(redis, selector).map_err(StorageError::from)?)
 }
 
@@ -151,13 +156,35 @@ async fn update(args: UpdateArgs) -> Result<(), CliError> {
     }
 }
 
+async fn transform_feed(path: &Path) -> Result<Vec<VTData>, CliError> {
+    // An explanation for those who think the code below looks strange:
+    //
+    // The feed transform is supposed to iterate over all the nasl files in the feed, extract their
+    // metadata from the description block and convert the results into a large json file. You might
+    // think a reasonable implementation of this would simply loop over all the nasl files and call
+    // some `parse_meta_data` function on the file and return the results. However, the reality is a
+    // little more complicated - a small percentage of the scripts in the feed have actual control
+    // flow in the description blocks. As a result, we need a full blown interpreter to run the NASL
+    // script. The interpreter will then execute all the statements in the description block. The
+    // builtin description functions which are called in those description blocks will write their
+    // results into the local `vt` field of the scan context of the interpreter. When the scan
+    // context is dropped, the fields are written into the storage from where we can then extract
+    // them and convert them into json. This is very awkward but the alternative is to have a second
+    // path for the interpreter, and that comes with a lot more code than doing something slightly
+    // convoluted below.
+    let storage = Arc::new(InMemoryStorage::default());
+    update::run_no_verifier(Arc::clone(&storage), path).await?;
+    Ok(storage
+        .retrieve(&Feed)
+        .await
+        .map_err(CliErrorKind::from)?
+        .unwrap_or_default())
+}
+
 async fn transform(args: TransformArgs) -> Result<(), CliError> {
-    let mut o = ArrayWrapper::new(io::stdout());
-    let dispatcher = JsonStorage::new(&mut o);
-    update::run_no_verifier(dispatcher, &args.path).await?;
-    o.end()
-        .map_err(StorageError::from)
-        .map_err(|e| CliErrorKind::from(e).into())
+    let vts = transform_feed(&args.path).await?;
+    serde_json::to_writer(io::stdout().lock(), &vts)?;
+    Ok(())
 }
 
 pub async fn run(args: FeedArgs) -> Result<(), CliError> {
@@ -166,4 +193,25 @@ pub async fn run(args: FeedArgs) -> Result<(), CliError> {
         Action::Transform(args) => transform(args).await?,
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{fs::File, path::Path};
+
+    use scannerlib::models::VTData;
+
+    #[tokio::test]
+    async fn feed_transform() {
+        let example_feed_path =
+            Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/feed/nasl"));
+        let mut vts = super::transform_feed(example_feed_path).await.unwrap();
+        let mut stored_vts: Vec<VTData> = serde_json::from_reader(
+            File::open(example_feed_path.join("vt-metadata.json")).unwrap(),
+        )
+        .unwrap();
+        vts.sort_by_key(|vt| (vt.oid.clone(), vt.name.clone()));
+        stored_vts.sort_by_key(|vt| (vt.oid.clone(), vt.name.clone()));
+        assert_eq!(vts, stored_vts);
+    }
 }

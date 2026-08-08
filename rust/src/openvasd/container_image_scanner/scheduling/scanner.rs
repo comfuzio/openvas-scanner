@@ -1,26 +1,28 @@
 use std::sync::Arc;
 
 use futures::{StreamExt, TryFutureExt};
-use greenbone_scanner_framework::models;
 use tokio::sync::RwLock;
 
 use crate::{
     container_image_scanner::{
         Config, ExternalError,
-        benchy::{self, BenchType, Benched, Measured},
         detection::{self, OperatingSystem},
         image::{
-            Digest, Image, ImageParseError, ImageState, Registry, RegistryError,
-            extractor::{self, Extractor, Locator},
-            packages::ToNotus,
+            Digest, Image, ImageParseError, ImageState, RegistryError,
+            extractor::{self, Extractor, FileSystemLocator},
+            packages::AllTypes,
         },
         messages::{self, CustomerMessage, DetailPair},
         notus,
         scheduling::db::{DataBase, images::DBImages},
+        timings::{Timed, Timing, TimingType},
     },
     database::dao::Fetch,
 };
-use scannerlib::notus::{Notus, NotusError};
+use scannerlib::{
+    models,
+    notus::{Notus, NotusError},
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ScannerArchImageError {
@@ -86,7 +88,7 @@ impl ImageResults {
     }
 }
 
-impl Measured<ImageResults> {
+impl Timed<ImageResults> {
     async fn store_log_messages(
         self,
         pool: &DataBase,
@@ -94,6 +96,7 @@ impl Measured<ImageResults> {
         image: &Image,
         architecture: &str,
         digest: &Image,
+        layer_timings: &[Timing],
     ) -> Result<(), ScannerArchImageError> {
         let (scan_duration, result) = self.unpack();
         tracing::debug!(
@@ -110,31 +113,30 @@ impl Measured<ImageResults> {
         );
         let message = |msg| CustomerMessage::log(Some(image), Some(digest), msg, None).into();
 
-        let layer_timings = Benched::retrieve(pool, id, &image.to_string()).await;
         let (image_extraction, image_download) =
             layer_timings
                 .iter()
                 .fold((0, 0), |(ie, id), x| match x.kind() {
-                    BenchType::Download => (ie, id + x.micro_seconds()),
-                    BenchType::Extraction => (ie + x.micro_seconds(), id),
-                    // usually not stored in the DB and if so ignored
-                    BenchType::Scan | BenchType::All => (ie, id),
+                    TimingType::Download => (ie, id + x.micro_seconds()),
+                    TimingType::Extraction => (ie + x.micro_seconds(), id),
+                    // Aggregate timings are constructed below, not collected per layer.
+                    TimingType::Scan | TimingType::All => (ie, id),
                 });
         let scan_timings = [
-            Benched::scan(&scan_duration),
-            Benched::new(None, BenchType::Extraction, image_extraction),
-            Benched::new(None, BenchType::Download, image_download),
-            Benched::new(
+            Timing::scan(&scan_duration),
+            Timing::new(None, TimingType::Extraction, image_extraction),
+            Timing::new(None, TimingType::Download, image_download),
+            Timing::new(
                 None,
-                BenchType::All,
+                TimingType::All,
                 image_download + image_extraction + scan_duration.as_micros(),
             ),
         ];
         scan_timings.iter().for_each(|x| {
             messages.push(message(x.msg()));
         });
+        let host_detail = |dp| CustomerMessage::host_detail(image, digest, dp).into();
         if let Some(os) = &result.os {
-            let host_detail = |dp| CustomerMessage::host_detail(image, digest, dp).into();
             messages.extend_from_slice(&[
                 host_detail(DetailPair::OS(os)),
                 host_detail(DetailPair::OSCpe(os)),
@@ -143,6 +145,8 @@ impl Measured<ImageResults> {
                 host_detail(DetailPair::Packages(result.packages)),
             ]);
         } else {
+            messages.push(host_detail(DetailPair::HostName(image)));
+            messages.push(host_detail(DetailPair::Architecture(architecture)));
             messages.push(message(
                 "No operating system information found.".to_string(),
             ));
@@ -154,20 +158,16 @@ impl Measured<ImageResults> {
     }
 }
 
-async fn scan_arch_image<L, T>(
+async fn scan_arch_image(
     products: Arc<RwLock<Notus>>,
-    locator: &L,
+    locator: &FileSystemLocator,
     image: String,
     digest: &Image,
-) -> Result<ImageResults, ScannerArchImageError>
-where
-    L: Locator + Send + Sync,
-    T: ToNotus,
-{
+) -> Result<ImageResults, ScannerArchImageError> {
     use detection::OperatingSystemDetectionError as OSDE;
     match detection::operating_system(locator).await {
         Ok(os) => {
-            let packages = T::packages(locator).await;
+            let packages = AllTypes::packages(locator).await;
 
             let results = if packages.is_empty() {
                 // This can also happen if a container image does not have a package DB anymore (e.g. the
@@ -208,17 +208,13 @@ async fn is_digest_excluded(
         false
     }
 }
-async fn download_and_extract_image<'a, E, R>(
+async fn download_and_extract_image<'a>(
     config: Arc<Config>,
     pool: &DataBase,
-    registry: &'a super::InitializedRegistry<'a, R>,
+    registry: &'a super::InitializedRegistry<'a>,
     image: Image,
-) -> Result<(Digest, E, Vec<Benched>), ScannerError>
-where
-    E: Extractor + Send + Sync,
-    R: Registry + Send + Sync,
-{
-    let mut extractor = E::initialize(config.clone(), registry.id.clone()).await?;
+) -> Result<(Digest, Extractor, Vec<Timing>), ScannerError> {
+    let mut extractor = Extractor::initialize(config.clone(), registry.id.clone()).await?;
     let mut results = Vec::new();
     let mut digest = None;
 
@@ -235,7 +231,7 @@ where
                 return Ok((digest.unwrap_or_default(), extractor, results));
             }
         }
-        results.push(Benched::download(lindex, &layer.download_time));
+        results.push(Timing::download(lindex, &layer.download_time));
 
         tracing::debug!(
             download_time_ms = layer.download_time.as_millis(),
@@ -245,7 +241,7 @@ where
         );
 
         let duration = extractor.extract(layer).await?;
-        results.push(Benched::extraction(lindex, &duration));
+        results.push(Timing::extraction(lindex, &duration));
 
         tracing::debug!(
             extraction_ms = duration.as_millis(),
@@ -261,25 +257,18 @@ where
     Ok((digest.unwrap_or_default(), extractor, results))
 }
 
-async fn retry_download_and_extract_image<'a, E, R>(
+async fn retry_download_and_extract_image<'a>(
     config: Arc<Config>,
     pool: &DataBase,
-    registry: &'a super::InitializedRegistry<'a, R>,
+    registry: &'a super::InitializedRegistry<'a>,
     image: &Image,
-) -> Result<(Image, E), ScannerError>
-where
-    E: Extractor + Send + Sync,
-    R: Registry + Send + Sync,
-{
+) -> Result<(Image, Extractor, Vec<Timing>), ScannerError> {
     // alternatively set back to pending and store retry amount alongside the image
     let mut retries = config.image.scanning_retries;
     loop {
         match download_and_extract_image(config.clone(), pool, registry, image.clone()).await {
             Ok((digest, ex, benched)) => {
-                for b in benched {
-                    b.store(pool, registry.id.id(), registry.id.image()).await;
-                }
-                return Ok((image.clone().replace_tag(digest.into()), ex));
+                return Ok((image.clone().replace_tag(digest.into()), ex, benched));
             }
             Err(error) if error.can_retry() && retries > 0 => {
                 retries -= 1;
@@ -291,32 +280,27 @@ where
     }
 }
 
-pub async fn scan_image<'a, E, R, T>(
+pub async fn scan_image<'a>(
     config: Arc<Config>,
     pool: DataBase,
     products: Arc<RwLock<Notus>>,
-    registry: &'a super::InitializedRegistry<'a, R>,
-) -> Result<(), Vec<ScannerError>>
-where
-    E: Extractor + Send + Sync,
-    R: Registry + Send + Sync,
-    T: ToNotus,
-{
+    registry: &'a super::InitializedRegistry<'a>,
+) -> Result<(), Vec<ScannerError>> {
     let image: Image = registry
         .id
         .image()
         .parse()
         .map_err(|e| vec![ScannerError::from(e)])?;
 
-    let (digest, locator_per_arch) =
-        retry_download_and_extract_image::<E, _>(config, &pool, registry, &image)
+    let (digest, locator_per_arch, layer_timings) =
+        retry_download_and_extract_image(config, &pool, registry, &image)
             .await
             .map_err(|e| vec![e])?;
     let locator_per_arch = locator_per_arch.locator().await;
 
     let mut errors = Vec::with_capacity(locator_per_arch.len());
     for locator in locator_per_arch.iter() {
-        let measured = benchy::measure_result(scan_arch_image::<_, T>(
+        let measured = Timed::measure_result(scan_arch_image(
             products.clone(),
             locator,
             registry.id.image.to_owned(),
@@ -331,6 +315,7 @@ where
                     &image,
                     locator.architecture(),
                     &digest,
+                    &layer_timings,
                 )
             })
             .await

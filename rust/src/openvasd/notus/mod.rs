@@ -4,7 +4,7 @@
 
 use std::{pin::Pin, sync::Arc};
 
-use greenbone_scanner_framework::{
+use crate::greenbone_scanner_framework::{
     ClientIdentifier, RequestHandler,
     entry::{Bytes, Method, Prefixed, Uri, response::BodyKind},
 };
@@ -113,9 +113,12 @@ impl RequestHandler for PostOSIcnomingRequest {
             {
                 Ok(x) => BodyKind::json_content(StatusCode::OK, &x),
                 Err(NotusError::UnknownProduct(_)) => BodyKind::no_content(StatusCode::NOT_FOUND),
+                Err(NotusError::PackageParseError(e)) => {
+                    BodyKind::json_content(StatusCode::BAD_REQUEST, &e)
+                }
                 Err(error) => {
                     tracing::warn!(%error, "Unable to get available products.");
-                    BodyKind::no_content(StatusCode::INTERNAL_SERVER_ERROR)
+                    BodyKind::json_content(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string())
                 }
             }
         })
@@ -135,10 +138,13 @@ pub fn init(notus: Arc<RwLock<Notus>>) -> (GetOSIcnomingRequest, PostOSIcnomingR
 
 #[cfg(test)]
 mod tests {
-    use greenbone_scanner_framework::{
-        Authentication, ClientHash, create_single_handler,
+    use crate::greenbone_scanner_framework::{
+        Authentication,
+        entry::ClientHash,
         entry::{Method, test_utilities},
     };
+
+    use crate::create_single_handler;
     use http::StatusCode;
     use hyper::service::Service;
 
@@ -161,7 +167,7 @@ mod tests {
         let notus = crate::config::Notus {
             advisories_path,
             products_path,
-            address: None,
+            url: None,
         };
 
         Config {
@@ -176,7 +182,7 @@ mod tests {
         let config = config();
         let (undertest, _) = super::init(super::config_to_products(&config));
         let entry_point = test_utilities::entry_point(
-            Authentication::MTLS,
+            Authentication::Mtls,
             create_single_handler!(undertest),
             Some(ClientHash::default()),
         );
@@ -191,7 +197,7 @@ mod tests {
         let config = config();
         let (_, undertest) = super::init(super::config_to_products(&config));
         let entry_point = test_utilities::entry_point(
-            Authentication::MTLS,
+            Authentication::Mtls,
             create_single_handler!(undertest),
             Some(ClientHash::default()),
         );

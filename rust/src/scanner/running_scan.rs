@@ -10,6 +10,7 @@ use std::{
     time::SystemTime,
 };
 
+use crate::models::{HostInfo, Phase, Status};
 use crate::nasl::utils::scan_ctx::{ContextStorage, NotusCtx};
 use crate::nasl::{syntax::Loader, utils::Executor};
 use crate::scanner::Error;
@@ -18,7 +19,6 @@ use crate::{
     scheduling::{Scheduler, SchedulerStorage, VTError},
 };
 use futures::StreamExt;
-use greenbone_scanner_framework::models::{HostInfo, Phase, Status};
 use tokio::{sync::RwLock, task::JoinHandle};
 use tracing::{debug, trace, warn};
 
@@ -82,11 +82,16 @@ where
     }
 
     async fn run(self) -> Result<(), Error> {
-        let runner = self.make_runner().await?;
+        let runner = match self.make_runner().await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!("{}", e);
+                return Err(e);
+            }
+        };
         self.update_status_at_beginning_of_run(runner.host_info())
             .await;
         let end_phase = self.run_to_completion(runner).await;
-
         self.update_status_at_end_of_run(end_phase).await;
         Ok(())
     }

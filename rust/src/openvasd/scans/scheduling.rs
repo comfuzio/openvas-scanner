@@ -3,9 +3,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-use greenbone_scanner_framework::models::{self, Scan};
 use scannerlib::{
-    models::FeedType,
+    models::{self, FeedType, Scan},
     nasl::{builtin::nasl_std_executor, syntax::Loader},
     openvas::{self, cmd},
     osp,
@@ -367,9 +366,14 @@ where
     async fn scan_stop(&self, id: i64) -> R<()> {
         let scan_id: String = ScanDB::new(&self.pool, id).fetch().await?;
 
+        let current_status = self.scan_state.scan_get_status(id).await?;
+        if current_status.is_stopped() {
+            tracing::debug!(id, "Scan already stopped");
+            return Ok(());
+        }
+
         self.scan_import_results(id, scan_id.clone()).await?;
         self.scanner.stop_scan(scan_id.clone()).await?;
-
         let changed = self
             .scan_state
             .change_state(id, "running", "stopped")
@@ -600,7 +604,7 @@ where
             init_with_scanner(pool, crypter, config, scanner, feed_status).await
         }
         scanner_types::ScannerType::Openvas => {
-            let redis_url = cmd::get_redis_socket();
+            let redis_url = cmd::get_redis_socket().await;
 
             let scanner = openvas::OpenvasScanner::new(
                 config.scheduler.min_free_mem,
@@ -617,7 +621,8 @@ where
             let executor = nasl_std_executor();
             let notus = config
                 .notus
-                .address
+                .url
+                .clone()
                 .map(scannerlib::nasl::utils::scan_ctx::NotusCtx::Address);
             let storage = ScanStorage::new(pool.clone());
             let scanner = OpenvasdScanner::new(storage, loader, executor, notus);

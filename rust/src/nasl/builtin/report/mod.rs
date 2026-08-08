@@ -4,7 +4,7 @@
 
 use std::sync::{Arc, RwLock};
 
-use greenbone_scanner_framework::models::{self, Protocol, ResultType};
+use crate::models::{self, Protocol, ResultType};
 
 use crate::nasl::prelude::*;
 
@@ -60,7 +60,7 @@ impl Reporting {
             r_type: typus,
             ip_address: Some(ip_address.to_string()),
             hostname,
-            oid: Some(ctx.scan().0.clone()),
+            oid: ctx.nvt().as_ref().map(|vt| vt.oid.clone()),
             port,
             protocol: Some(protocol),
             message: data,

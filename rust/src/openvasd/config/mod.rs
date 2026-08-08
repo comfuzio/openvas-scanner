@@ -42,7 +42,8 @@ pub struct Feed {
 pub struct Notus {
     pub products_path: PathBuf,
     pub advisories_path: PathBuf,
-    pub address: Option<SocketAddr>,
+    /// The URL to the Notus endpoint of a Skiron service (e.g. http://127.0.0.1:8085/skiron/v2/api/scanNotus)
+    pub url: Option<url::Url>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -126,7 +127,7 @@ impl Default for Notus {
         Notus {
             products_path: PathBuf::from("/var/lib/notus/products"),
             advisories_path: PathBuf::from("/var/lib/notus/advisories"),
-            address: None,
+            url: None,
         }
     }
 }
@@ -368,9 +369,9 @@ impl Config {
         }
     }
 
-    fn from_file<P>(path: P) -> Self
+    pub fn from_file<P>(path: P) -> Self
     where
-        P: AsRef<std::path::Path> + std::fmt::Display + std::fmt::Debug,
+        P: AsRef<std::path::Path>,
     {
         let config = std::fs::read_to_string(path).unwrap();
 
@@ -406,7 +407,9 @@ impl Config {
                     .long("feed-path")
                     .value_parser(clap::builder::PathBufValueParser::new())
                     .action(ArgAction::Set)
-                    .help("path to openvas feed"),
+                    .help(
+                        "path to openvas feed. its parent directory must be writable unless --lock-file-dir is set",
+                    ),
             )
             .arg(
                 clap::Arg::new("lock-file-dir")
@@ -414,7 +417,9 @@ impl Config {
                     .long("lock-file-dir")
                     .value_parser(clap::builder::PathBufValueParser::new())
                     .action(ArgAction::Set)
-                    .help("path to the lock file directory"),
+                    .help(
+                        "directory in which openvasd creates feed-update.lock. must be writable",
+                    ),
             )
 
             .arg(
@@ -447,13 +452,13 @@ impl Config {
                     .action(ArgAction::Set)
                     .help("Path containing the Notus products directory"))
             .arg(
-                clap::Arg::new("notus-address")
-                    .env("NOTUS_ADDRESS")
-                    .long("notus-address")
-                    .value_name("IP:PORT")
-                    .value_parser(clap::value_parser!(SocketAddr))
+                clap::Arg::new("notus-url")
+                    .env("NOTUS_URL")
+                    .long("notus-url")
+                    .value_name("URL")
+                    .value_parser(clap::value_parser!(url::Url))
                     .action(ArgAction::Set)
-                    .help("the address to reach notus on"))
+                    .help("The URL to the Notus endpoint of a Skiron service (e.g. http://127.0.0.1:8085/skiron/v2/api/scanNotus)"))
             .arg(
                 clap::Arg::new("redis-url")
                     .long("redis-url")
@@ -523,6 +528,7 @@ impl Config {
                     .env("MAX_QUEUED_SCANS")
                     .long("max-queued-scans")
                     .action(ArgAction::Set)
+                    .value_parser(clap::value_parser!(usize))
                     .help("Maximum number of queued scans")
             )
             .arg(
@@ -530,6 +536,7 @@ impl Config {
                     .env("MAX_RUNNING_SCANS")
                     .long("max-running-scans")
                     .action(ArgAction::Set)
+                    .value_parser(clap::value_parser!(usize))
                     .help("Maximum number of active running scans, omit for no limits")
 
             )
@@ -594,7 +601,9 @@ impl Config {
                     .long("storage-path")
                     .value_name("PATH")
                     .value_parser(clap::builder::PathBufValueParser::new())
-                    .help("the path that contains the files when type is set to fs."),
+                    .help(
+                        "directory for the openvasd and container image scanner database files. must be writable",
+                    ),
             )
             .arg(
                 clap::Arg::new("storage_key")
@@ -691,8 +700,8 @@ impl Config {
         if let Some(path) = cmds.get_one::<PathBuf>("notus-advisories") {
             config.notus.advisories_path.clone_from(path);
         }
-        if let Some(address) = cmds.get_one::<SocketAddr>("notus-address") {
-            config.notus.address = Some(*address);
+        if let Some(url) = cmds.get_one::<url::Url>("notus-url") {
+            config.notus.url = Some(url.clone());
         }
         if let Some(_path) = cmds.get_one::<String>("redis-url") {
             // is actually ignored as on scanner openvas the redis-url of openvas is used

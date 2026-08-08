@@ -4,11 +4,11 @@
 
 // Maybe move products to notus so they are the same as advisories
 
-use greenbone_scanner_framework::models::Product;
+use crate::models::Product;
 
 use crate::nasl::syntax::{LoadError, Loader};
 
-use crate::feed::{HashSumFileItem, HashSumNameLoader, SignatureChecker, VerifyError};
+use crate::feed::{HashSumFileItem, HashSumNameLoader, VerifyError};
 use crate::feed::{NoVerifier, check_signature};
 use crate::notus::advisories::ProductsAdvisories;
 use crate::notus::error::{Error, LoadProductErrorKind};
@@ -18,8 +18,6 @@ pub struct ProductLoader {
     loader: Loader,
     feed_integrity_check: bool,
 }
-
-impl SignatureChecker for ProductLoader {}
 
 impl ProductLoader {
     pub fn new(feed_integrity_check: bool, loader: Loader) -> Self {

@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: GPL-2.0-or-later WITH x11vnc-openssl-exception
 
-use greenbone_scanner_framework::models::{self, Protocol, ResultType};
+use crate::models::{self, Protocol, ResultType};
 
 use crate::nasl::test_prelude::*;
 
@@ -38,7 +38,7 @@ async fn verify(function: &str, result_type: ResultType) {
             r_type: result_type.clone(),
             ip_address: Some(ctx.target().ip_addr().to_string()),
             hostname: Some("".into()),
-            oid: Some(ctx.scan().0.clone()),
+            oid: ctx.nvt().as_ref().map(|vt| vt.oid.clone()),
             port,
             protocol: Some(protocol),
             message: Some(format!("test{id}")),

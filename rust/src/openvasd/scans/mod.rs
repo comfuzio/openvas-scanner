@@ -4,10 +4,10 @@ use crate::database::{
     dao::{DAOError, DBViolation, Execute, Fetch, StreamFetch},
     sqlite::{DataBase, results::DBResults, scans::ScanDB},
 };
+use crate::greenbone_scanner_framework::InternalIdentifier;
+use crate::greenbone_scanner_framework::prelude::*;
 use futures::TryStreamExt;
-use greenbone_scanner_framework::InternalIdentifier;
-use greenbone_scanner_framework::prelude::*;
-use scannerlib::scanner;
+use scannerlib::{models, scanner};
 use tokio::sync::mpsc::Sender;
 
 use crate::{
@@ -214,6 +214,18 @@ where
         id: String,
     ) -> Pin<Box<dyn Future<Output = Result<(), DeleteScansIDError>> + Send + '_>> {
         Box::pin(async move {
+            // Ensure the scan is not running.
+            let internal_id: i64 = id
+                .parse()
+                .map_err(|e| DeleteScansIDError::External(Box::new(e)))?;
+            let status: models::Status = ScanDB::new(&self.pool, internal_id)
+                .fetch()
+                .await
+                .map_err(|e| DeleteScansIDError::External(Box::new(e)))?;
+            if status.is_running() {
+                return Err(DeleteScansIDError::Running);
+            }
+
             // everything else should have ON DELETE CASCADE
             ScanDB::new(&self.pool, id)
                 .exec()
@@ -255,17 +267,17 @@ pub mod tests {
 
     use super::*;
 
-    use futures::StreamExt;
-    use greenbone_scanner_framework::{
+    use crate::greenbone_scanner_framework::{
         GetScans, GetScansId, GetScansIdResults, GetScansIdStatus, GetScansPreferences, MapScanID,
-        PostScans, PostScansError,
-        models::{
-            self, AliveTestMethods, Credential, CredentialType, PrivilegeInformation,
-            ScanPreference, Service,
-        },
-        prelude::PostScansId,
+        PostScans, PostScansError, prelude::PostScansId,
     };
-    use scannerlib::{models::Phase, scanner, utils::scanner_types::ScannerType};
+
+    use futures::StreamExt;
+    use scannerlib::models::{
+        self, AliveTestMethods, Credential, CredentialType, Phase, PrivilegeInformation,
+        ScanPreference, Service,
+    };
+    use scannerlib::{scanner, utils::scanner_types::ScannerType};
     use sqlx::{SqlitePool, query_scalar};
 
     use crate::{
@@ -511,7 +523,7 @@ pub mod tests {
         let notus = crate::config::Notus {
             advisories_path,
             products_path,
-            address: None,
+            url: None,
         };
         let scanner = crate::config::Scanner {
             scanner_type: ScannerType::Openvasd,

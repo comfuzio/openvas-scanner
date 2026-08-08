@@ -4,7 +4,6 @@ use crate::vts::FeedHashes;
 use crate::vts::Plugin;
 use async_trait::async_trait;
 use futures::StreamExt;
-use greenbone_scanner_framework::GetVTsError;
 use scannerlib::Promise;
 use scannerlib::models::{FeedType, VTData};
 use scannerlib::notus::advisories::VulnerabilityData;
@@ -17,6 +16,7 @@ use sqlx::query;
 use sqlx::sqlite::SqliteRow;
 
 use crate::config::Config;
+use crate::greenbone_scanner_framework::{GetVTsError, StreamResult};
 use crate::vts::FeedHash;
 use crate::vts::PluginFetcher;
 use crate::vts::PluginStorer;
@@ -43,16 +43,14 @@ impl From<SqlitePool> for SqlPluginStorage {
 }
 
 impl PluginFetcher for SqlPluginStorage {
-    fn get_oids(&self) -> greenbone_scanner_framework::StreamResult<String, WorkerError> {
+    fn get_oids(&self) -> StreamResult<String, WorkerError> {
         let result = query("SELECT oid FROM plugins ORDER BY oid")
             .fetch(&self.pool)
             .map(|row| row.map(|e| e.get("oid")).map_err(WorkerError::Cache));
         Box::pin(result)
     }
 
-    fn get_vts(
-        &self,
-    ) -> greenbone_scanner_framework::StreamResult<scannerlib::models::VTData, WorkerError> {
+    fn get_vts(&self) -> StreamResult<scannerlib::models::VTData, WorkerError> {
         let result = query("SELECT feed_type, json_blob FROM plugins")
             .fetch(&self.pool)
             .map(|row| {
@@ -78,6 +76,11 @@ impl PluginFetcher for SqlPluginStorage {
 }
 // TODO: verify before loading the plugin
 impl PluginStorer for SqlPluginStorage {
+    fn prepare_feed(&self, hash: &FeedHash) -> Promise<Result<(), WorkerError>> {
+        let pending = crate::vts::pending_hash(hash);
+        self.store_hash(&pending)
+    }
+
     fn store_plugin<T>(&self, hash: &FeedHash, plugin: T) -> Promise<Result<(), WorkerError>>
     where
         T: Plugin + Send + Sync + 'static,
@@ -104,13 +107,16 @@ impl PluginStorer for SqlPluginStorage {
         let ht = hash.typus;
         let hash = hash.hash.clone();
         Box::pin(async move {
-            query("INSERT OR REPLACE INTO feed (hash, path, type) VALUES (?, ?, ?)")
-                .bind(hash)
-                .bind(path)
-                .bind(ht.as_ref())
-                .execute(&pool)
-                .await
-                .map_err(error_vts_error)?;
+            query(
+                "INSERT INTO feed (hash, path, type) VALUES (?, ?, ?)
+                 ON CONFLICT(type) DO UPDATE SET hash = excluded.hash, path = excluded.path",
+            )
+            .bind(hash)
+            .bind(path)
+            .bind(ht.as_ref())
+            .execute(&pool)
+            .await
+            .map_err(error_vts_error)?;
             Ok(())
         })
     }
@@ -249,8 +255,8 @@ mod tests {
     use std::sync::{Arc, RwLock};
 
     use crate::container_image_scanner::endpoints::vts::VTEndpoints;
-    use greenbone_scanner_framework::models::FeedState;
-    use greenbone_scanner_framework::{GetVTsError, GetVts};
+    use crate::greenbone_scanner_framework::{GetVTsError, GetVts};
+    use scannerlib::models::FeedState;
 
     use crate::setup_sqlite;
 

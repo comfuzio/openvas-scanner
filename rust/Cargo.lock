@@ -2116,32 +2116,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0cc23270f6e1808e30a928bdc84dea0b9b4136a8bc82338574f23baf47bbd280"
 
 [[package]]
-name = "greenbone-scanner-framework"
-version = "0.1.0"
-dependencies = [
- "futures",
- "futures-util",
- "http-body",
- "http-body-util",
- "hyper",
- "hyper-util",
- "insta",
- "once_cell",
- "rustls",
- "serde",
- "serde_json",
- "sha2 0.11.0",
- "signal-hook",
- "signal-hook-tokio",
- "thiserror 2.0.18",
- "time",
- "tokio",
- "tokio-rustls",
- "tracing",
- "uuid",
-]
-
-[[package]]
 name = "group"
 version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2590,6 +2564,8 @@ checksum = "86f0f8fee8c926415c58d6ae43a08523a26faccb2323f5e6b644fe7dd4ef6b82"
 dependencies = [
  "console",
  "once_cell",
+ "pest",
+ "pest_derive",
  "ron",
  "serde",
  "similar",
@@ -3722,6 +3698,48 @@ name = "percent-encoding"
 version = "2.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
+
+[[package]]
+name = "pest"
+version = "2.8.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "47627dd7305c6a2d6c8c6bcd24c5a4c17dbbf425f4f9c5313e724b38fc9782e9"
+dependencies = [
+ "memchr",
+ "ucd-trie",
+]
+
+[[package]]
+name = "pest_derive"
+version = "2.8.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4b4254325ecad416ab689e27ba51da03ba01a9632bc6e108f5fe7c3c4ad29d58"
+dependencies = [
+ "pest",
+ "pest_generator",
+]
+
+[[package]]
+name = "pest_generator"
+version = "2.8.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6c4c0e91ead7a8f7acecbca6f003fc2e8282b1dbe2dd9c9d2f16aba42995e0a7"
+dependencies = [
+ "pest",
+ "pest_meta",
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
+name = "pest_meta"
+version = "2.8.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f9744bc48116fee06334924bb5f2bad41eed5e89bd26e29b0b799f9a3f82c210"
+dependencies = [
+ "pest",
+]
 
 [[package]]
 name = "petgraph"
@@ -4875,14 +4893,17 @@ dependencies = [
  "flate2",
  "fslock",
  "futures",
+ "futures-util",
  "generic-array 1.4.3",
  "glob",
- "greenbone-scanner-framework",
  "h2",
  "hex",
  "hmac 0.13.0",
  "http",
+ "http-body",
+ "http-body-util",
  "hyper",
+ "hyper-util",
  "insta",
  "itertools 0.15.0",
  "lazy-regex",
@@ -4928,6 +4949,8 @@ dependencies = [
  "serde_json",
  "sha1 0.11.0",
  "sha2 0.11.0",
+ "signal-hook",
+ "signal-hook-tokio",
  "snmp2",
  "socket2",
  "sqlx",
@@ -4935,6 +4958,7 @@ dependencies = [
  "tar",
  "tempfile",
  "thiserror 2.0.18",
+ "time",
  "tokio",
  "tokio-rustls",
  "toml",
@@ -4942,6 +4966,7 @@ dependencies = [
  "tracing-appender",
  "tracing-subscriber",
  "tracing-test",
+ "url",
  "urlencoding",
  "uuid",
  "vergen-git2",
@@ -6276,6 +6301,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
 
 [[package]]
+name = "ucd-trie"
+version = "0.1.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2896d95c02a80c6d6a5d6e953d479f5ddf2dfdb6a244441010e373ac0fb88971"
+
+[[package]]
 name = "unicode-bidi"
 version = "0.3.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6356,6 +6387,7 @@ dependencies = [
  "idna",
  "percent-encoding",
  "serde",
+ "serde_derive",
 ]
 
 [[package]]

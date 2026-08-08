@@ -1,14 +1,10 @@
-use std::{fs, path::PathBuf, str::FromStr, task::Poll, time::UNIX_EPOCH};
+use std::{fs, path::PathBuf, task::Poll, time::UNIX_EPOCH};
 
+use crate::greenbone_scanner_framework::{GetVTsError, StreamResult};
 use futures::Stream;
-use greenbone_scanner_framework::GetVTsError;
 use scannerlib::{
     models::{FeedType, VTData},
-    openvas::cmd,
-    storage::redis::{
-        CACHE_KEY, DbError, NOTUS_KEY, RedisAddAdvisory, RedisAddNvt, RedisCtx, RedisGetNvt,
-        RedisWrapper,
-    },
+    storage::redis::{CACHE_KEY, DbError, NOTUS_KEY, RedisCtx},
 };
 
 use crate::{
@@ -28,8 +24,7 @@ pub struct FeedSynchronizer {
 }
 
 impl FeedSynchronizer {
-    pub fn new(config: &Config) -> Self {
-        let address = cmd::get_redis_socket();
+    pub fn new(config: &Config, address: String) -> Self {
         let plugin_feed = config.feed.path.clone();
         let advisory_feed = config.notus.advisories_path.clone();
         let signature_check = config.feed.signature_check;
@@ -44,12 +39,6 @@ impl FeedSynchronizer {
             address,
             plugin_storer,
         }
-    }
-}
-
-impl From<&Config> for FeedSynchronizer {
-    fn from(value: &Config) -> Self {
-        Self::new(value)
     }
 }
 
@@ -70,12 +59,9 @@ pub struct RedisPluginHandler {
     feed_path: PathBuf,
 }
 
-impl From<&Config> for RedisPluginHandler {
-    fn from(_: &Config) -> Self {
-        Self {
-            address: cmd::get_redis_socket(),
-            feed_path: PathBuf::from_str(cmd::get_plugins_folder().as_str()).unwrap(),
-        }
+impl RedisPluginHandler {
+    pub fn new(address: String, feed_path: PathBuf) -> Self {
+        Self { address, feed_path }
     }
 }
 
@@ -263,18 +249,21 @@ impl Stream for RedisVTDataStream {
 }
 
 impl PluginFetcher for RedisPluginHandler {
-    fn get_oids(&self) -> greenbone_scanner_framework::StreamResult<String, WorkerError> {
+    fn get_oids(&self) -> StreamResult<String, WorkerError> {
         Box::pin(RedisOidStream::from(self.address.clone()))
     }
 
-    fn get_vts(
-        &self,
-    ) -> greenbone_scanner_framework::StreamResult<scannerlib::models::VTData, WorkerError> {
+    fn get_vts(&self) -> StreamResult<scannerlib::models::VTData, WorkerError> {
         Box::pin(RedisVTDataStream::from(self.address.clone()))
     }
 }
 
 impl PluginStorer for RedisPluginHandler {
+    fn prepare_feed(&self, hash: &super::FeedHash) -> scannerlib::Promise<Result<(), WorkerError>> {
+        let pending = super::pending_hash(hash);
+        self.store_hash(&pending)
+    }
+
     fn store_hash(&self, hash: &super::FeedHash) -> scannerlib::Promise<Result<(), WorkerError>> {
         redis_with_hash(
             self.address.clone(),
