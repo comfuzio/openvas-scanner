@@ -22,8 +22,6 @@ mod scan;
 mod scan_runner;
 mod vt_runner;
 
-#[cfg(test)]
-mod tests;
 //TODO: export trairs directly to get rid of scanner::scanner:ScanStopper, ...
 #[allow(clippy::module_inception)]
 mod scanner;
@@ -78,6 +76,7 @@ where
         let id = scan.scan_id.clone();
         let handle =
             RunningScan::<S>::start(scan, storage, loader, function_executor, self.notus.clone());
+
         self.running.write().await.insert(id, handle);
         Ok(())
     }

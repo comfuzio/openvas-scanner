@@ -25,6 +25,7 @@ use std::collections::HashSet;
 use std::str::FromStr;
 use std::time::Duration;
 use tokio::sync::mpsc::{self, Receiver, Sender};
+use tokio::sync::oneshot;
 use tokio::time::sleep;
 
 use std::net::IpAddr;
@@ -52,7 +53,7 @@ struct AliveTestCtlStop;
 #[derive(Debug, Clone)]
 struct AliveHostInfo {
     ip: String,
-    detectihttp_method: AliveTestMethods,
+    detection_method: AliveTestMethods,
 }
 
 struct PktCodec;
@@ -70,7 +71,6 @@ fn pkt_stream(
 ) -> Result<PacketStream<Active, PktCodec>, pcap::Error> {
     let cap = capture_inactive
         .promisc(false)
-        .immediate_mode(true)
         .timeout(DEFAULT_TIMEOUT * 1000)
         .immediate_mode(true)
         .open()?
@@ -117,7 +117,7 @@ fn process_ipv4_packet(packet: &[u8]) -> Result<Option<AliveHostInfo>, AliveTest
         {
             return Ok(Some(AliveHostInfo {
                 ip: pkt.get_source().to_string(),
-                detectihttp_method: AliveTestMethods::Icmp,
+                detection_method: AliveTestMethods::Icmp,
             }));
         }
     }
@@ -130,7 +130,7 @@ fn process_ipv4_packet(packet: &[u8]) -> Result<Option<AliveHostInfo>, AliveTest
         if tcp_packet.get_destination() == FILTER_PORT {
             return Ok(Some(AliveHostInfo {
                 ip: pkt.get_source().to_string(),
-                detectihttp_method: AliveTestMethods::TcpSyn,
+                detection_method: AliveTestMethods::TcpSyn,
             }));
         }
     }
@@ -149,7 +149,7 @@ fn process_ipv6_packet(packet: &[u8]) -> Result<Option<AliveHostInfo>, AliveTest
         let make_alive_host_ctl = |pkt: Ipv6Packet<'_>, method| {
             Ok(Some(AliveHostInfo {
                 ip: pkt.get_source().to_string(),
-                detectihttp_method: method,
+                detection_method: method,
             }))
         };
 
@@ -169,7 +169,7 @@ fn process_ipv6_packet(packet: &[u8]) -> Result<Option<AliveHostInfo>, AliveTest
         if tcp_packet.get_destination() == FILTER_PORT {
             return Ok(Some(AliveHostInfo {
                 ip: pkt.get_source().to_string(),
-                detectihttp_method: AliveTestMethods::TcpSyn,
+                detection_method: AliveTestMethods::TcpSyn,
             }));
         }
     }
@@ -183,7 +183,7 @@ fn process_arp_frame(frame: &[u8]) -> Result<Option<AliveHostInfo>, AliveTestErr
     if arp.get_operation() == ArpOperations::Reply {
         return Ok(Some(AliveHostInfo {
             ip: arp.get_sender_proto_addr().to_string(),
-            detectihttp_method: AliveTestMethods::Arp,
+            detection_method: AliveTestMethods::Arp,
         }));
     }
     Ok(None)
@@ -193,6 +193,7 @@ fn process_packet(packet: &[u8]) -> Result<Option<AliveHostInfo>, AliveTestError
     if packet.len() <= MIN_ALLOWED_PACKET_LEN {
         return Err(AliveTestError::WrongPacketLength);
     };
+
     // 2 last bytes in the data link layer of ether2 is the ether type (the protocol contained in the payload)
     let ether_type = &packet[14..16];
     let ether_type = EtherTypes::try_from(ether_type)?;
@@ -213,8 +214,10 @@ async fn capture_task(
     capture_inactive: Capture<Inactive>,
     mut rx_ctl: Receiver<AliveTestCtlStop>,
     tx_msg: Sender<AliveHostInfo>,
+    tx_ready: oneshot::Sender<()>,
 ) -> Result<(), AliveTestError> {
     let mut stream = pkt_stream(capture_inactive).expect("Failed to create stream");
+    tx_ready.send(()).unwrap();
     tracing::debug!("Start capture loop");
 
     loop {
@@ -378,13 +381,24 @@ impl Scanner {
     }
 
     pub async fn run_alive_test(&self) -> Result<HashSet<String>, AliveTestError> {
-        // TODO: Replace with a Storage type to store the alive host list
-        let mut alive = HashSet::<String>::new();
+        self.run_alive_test_streaming(None).await
+    }
 
-        if self.methods.contains(&AliveTestMethods::ConsiderAlive) {
+    pub async fn run_alive_test_streaming(
+        &self,
+        notify: Option<Sender<Host>>,
+    ) -> Result<HashSet<String>, AliveTestError> {
+        let mut alive = HashSet::<String>::new();
+        if self.methods.contains(&AliveTestMethods::ConsiderAlive) || self.methods.is_empty() {
             for t in self.target.iter() {
                 alive.insert(t.clone());
-                println!("{t} via {}", AliveTestMethods::ConsiderAlive)
+                println!("{t} via {}", AliveTestMethods::ConsiderAlive);
+                if let Some(tx) = &notify {
+                    // if there is no receiver, we just stop here.
+                    if tx.send(t.clone()).await.is_err() {
+                        break;
+                    }
+                }
             }
             return Ok(alive);
         };
@@ -397,21 +411,43 @@ impl Scanner {
         let (tx_msg, mut rx_msg): (Sender<AliveHostInfo>, Receiver<AliveHostInfo>) =
             mpsc::channel(1024);
 
-        let capture_handle = tokio::spawn(capture_task(capture_inactive, rx_ctl, tx_msg));
+        // for signaling when the capture is ready.
+        let (tx_ready, rx_ready) = oneshot::channel();
+        let capture_handle = tokio::spawn(capture_task(capture_inactive, rx_ctl, tx_msg, tx_ready));
+
+        rx_ready
+            .await
+            .map_err(|_| AliveTestError::NoValidInterface("capture task exited early".into()))?;
 
         let timeout = self.timeout.unwrap_or((DEFAULT_TIMEOUT * 1000) as u64);
         let methods_c = self.methods.clone();
         let send_handle = tokio::spawn(send_task(methods_c, trgt, timeout, tx_ctl));
 
         while let Some(alivehost) = rx_msg.recv().await {
-            if self.target.contains(&alivehost.ip) && !alive.contains(&alivehost.ip) {
-                alive.insert(alivehost.ip.clone());
-                println!("{} via {:?}", &alivehost.ip, &alivehost.detectihttp_method);
-            } else if let Some(Ok(dst)) = get_host_discovery_ipv6_net(&self.methods, &self.target)
-                && dst.contains(&alivehost.ip.parse::<std::net::Ipv6Addr>().unwrap())
+            let newly_found = if self.target.contains(&alivehost.ip)
+                && !alive.contains(&alivehost.ip)
             {
+                Some((alivehost.ip.clone(), alivehost.detection_method.clone()))
+            } else if let Some(Ok(dst)) = get_host_discovery_ipv6_net(&self.methods, &self.target)
+                && dst.contains(
+                    &alivehost
+                        .ip
+                        .parse::<std::net::Ipv6Addr>()
+                        .expect("IPv6 address"),
+                )
+            {
+                Some((alivehost.ip.clone(), alivehost.detection_method.clone()))
+            } else {
+                None
+            };
+
+            if let Some((host, method)) = newly_found {
+                if let Some(tx) = &notify {
+                    tx.send(host).await.unwrap();
+                } else {
+                    println!("{} via {:?}", &host, &method);
+                }
                 alive.insert(alivehost.ip.clone());
-                println!("{} via {:?}", &alivehost.ip, &alivehost.detectihttp_method);
             }
         }
 
