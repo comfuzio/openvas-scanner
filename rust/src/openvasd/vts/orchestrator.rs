@@ -3,8 +3,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
 
-use crate::greenbone_scanner_framework::GetVTsError;
 use scannerlib::models::{FeedState, FeedType};
+use scannerlib::nasl::utils::mtime;
 use scannerlib::{Promise, feed};
 use tokio::sync::mpsc;
 
@@ -134,7 +134,9 @@ pub enum WorkerError {
     #[error(transparent)]
     Calculation(#[from] feed::VerifyError),
     #[error(transparent)]
-    Sync(#[from] GetVTsError),
+    Sync(#[from] Box<dyn std::error::Error + Send + Sync + 'static>),
+    #[error(transparent)]
+    MtimeCheckError(#[from] mtime::MtimeCheckError),
     #[error("Unable to serialize: {0}")]
     Serialization(#[from] serde_json::Error),
     #[error("Unable to send message. Receiver dropped.")]

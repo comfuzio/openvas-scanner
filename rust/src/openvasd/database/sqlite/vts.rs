@@ -1,3 +1,7 @@
+// Spdx-FileCopyrightText: 2026 Greenbone AG
+//
+// SPDX-License-Identifier: GPL-2.0-or-later WITH x11vnc-openssl-exception
+
 use std::path::PathBuf;
 
 use crate::vts::FeedHashes;
@@ -6,6 +10,7 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use scannerlib::Promise;
 use scannerlib::models::{FeedType, VTData};
+use scannerlib::nasl::utils::mtime::{MtimeCheckError, MtimeStatus, compute_mtime};
 use scannerlib::notus::advisories::VulnerabilityData;
 use scannerlib::storage::Retriever;
 use scannerlib::storage::error::StorageError;
@@ -15,11 +20,12 @@ use sqlx::SqlitePool;
 use sqlx::query;
 use sqlx::sqlite::SqliteRow;
 
+use crate::api::stream::StreamResult;
 use crate::config::Config;
-use crate::greenbone_scanner_framework::{GetVTsError, StreamResult};
 use crate::vts::FeedHash;
 use crate::vts::PluginFetcher;
 use crate::vts::PluginStorer;
+
 use crate::vts::orchestrator;
 use crate::vts::orchestrator::WorkerError;
 
@@ -34,11 +40,19 @@ pub struct FeedSynchronizer {
 #[derive(Debug, Clone)]
 pub struct SqlPluginStorage {
     pool: SqlitePool,
+    // Feed path necessary for checking the file mtime when signature is enabled
+    feed_root: PathBuf,
+    // Mtime is stored and later checked only if signature check is enabled.
+    signature_check: bool,
 }
 
-impl From<SqlitePool> for SqlPluginStorage {
-    fn from(value: SqlitePool) -> Self {
-        SqlPluginStorage { pool: value }
+impl SqlPluginStorage {
+    pub fn with_plugin_feed(pool: SqlitePool, feed_root: PathBuf, signature_check: bool) -> Self {
+        SqlPluginStorage {
+            pool,
+            feed_root,
+            signature_check,
+        }
     }
 }
 
@@ -74,7 +88,7 @@ impl PluginFetcher for SqlPluginStorage {
         Box::pin(result)
     }
 }
-// TODO: verify before loading the plugin
+
 impl PluginStorer for SqlPluginStorage {
     fn prepare_feed(&self, hash: &FeedHash) -> Promise<Result<(), WorkerError>> {
         let pending = crate::vts::pending_hash(hash);
@@ -87,15 +101,26 @@ impl PluginStorer for SqlPluginStorage {
     {
         let pool = self.pool.clone();
         let typus = hash.typus;
+        let plugin_feed = self.feed_root.clone();
         Box::pin(async move {
-            let json = serde_json::to_vec(&plugin).map_err(error_vts_error)?;
-            query(r#" INSERT INTO plugins ( oid, json_blob, feed_type) VALUES (?, ?, ?)"#)
-                .bind(plugin.oid())
-                .bind(&json)
-                .bind(typus.as_ref())
-                .execute(&pool)
-                .await
-                .map_err(error_vts_error)?;
+            let hashsum: String = plugin.hashsum().into();
+            let mtime = match (typus, plugin.vulnerability_test()) {
+                (FeedType::NASL, Some(vt)) => {
+                    compute_mtime(&plugin_feed.join(&vt.filename), Some(&hashsum))?
+                }
+                _ => 0,
+            };
+            let json = serde_json::to_vec(&plugin)?;
+            query(
+                r#" INSERT INTO plugins ( oid, json_blob, feed_type, hashsum, mtime) VALUES (?, ?, ?, ?, ?)"#,
+            )
+            .bind(plugin.oid())
+            .bind(&json)
+            .bind(typus.as_ref())
+            .bind(hashsum)
+            .bind(mtime)
+            .execute(&pool)
+            .await?;
 
             Ok(())
         })
@@ -115,10 +140,44 @@ impl PluginStorer for SqlPluginStorage {
             .bind(path)
             .bind(ht.as_ref())
             .execute(&pool)
-            .await
-            .map_err(error_vts_error)?;
+            .await?;
             Ok(())
         })
+    }
+}
+
+impl SqlPluginStorage {
+    // Check that the file mtime is not newer than the value stored.
+    pub async fn check_mtime(&self, filename: &str) -> Result<MtimeStatus, MtimeCheckError> {
+        if !self.signature_check {
+            return Ok(MtimeStatus::UpToDate);
+        }
+
+        let row =
+            query("SELECT mtime FROM plugins WHERE json_extract(json_blob, '$.filename') = ?")
+                .bind(filename)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| MtimeCheckError::Io(filename.to_string(), e.to_string()))?;
+
+        let stored_mtime = row
+            .as_ref()
+            .map(|r| r.get::<i64, _>("mtime"))
+            .filter(|s| *s != 0)
+            .ok_or_else(|| MtimeCheckError::NotFound(filename.to_string()))?;
+
+        let filename = self.feed_root.join(filename);
+        let current_mtime = compute_mtime(&self.feed_root.join(&filename), None)?;
+
+        if current_mtime > stored_mtime {
+            return Ok(MtimeStatus::Modified {
+                file: filename.clone().into_string().unwrap(),
+                stored: stored_mtime,
+                current: current_mtime,
+            });
+        }
+
+        Ok(MtimeStatus::UpToDate)
     }
 }
 
@@ -168,13 +227,6 @@ impl Retriever<FileName> for SqlPluginStorage {
             .transpose()
             .map(Option::flatten)
     }
-}
-
-fn error_vts_error<T>(error: T) -> GetVTsError
-where
-    T: std::error::Error + Sync + Send + 'static,
-{
-    GetVTsError::External(Box::new(error))
 }
 
 impl orchestrator::Worker for FeedSynchronizer {
@@ -244,7 +296,11 @@ impl FeedSynchronizer {
             plugin_feed: config.feed.path.clone(),
             advisory_feed: config.notus.advisories_path.clone(),
             signature_check: config.feed.signature_check,
-            plugin_storer: SqlPluginStorage { pool },
+            plugin_storer: SqlPluginStorage {
+                pool,
+                feed_root: config.feed.path.clone(),
+                signature_check: config.feed.signature_check,
+            },
         }
     }
 }
@@ -254,15 +310,26 @@ mod tests {
 
     use std::sync::{Arc, RwLock};
 
-    use crate::container_image_scanner::endpoints::vts::VTEndpoints;
-    use crate::greenbone_scanner_framework::{GetVTsError, GetVts};
+    use crate::api::{error::ApiError, states::Feed};
     use scannerlib::models::FeedState;
 
-    use crate::setup_sqlite;
+    use futures_util::StreamExt;
+
+    use crate::database::sqlite;
 
     use super::*;
 
-    async fn create_pool() -> crate::Result<(Config, SqlitePool)> {
+    impl From<SqlitePool> for SqlPluginStorage {
+        fn from(value: SqlitePool) -> Self {
+            SqlPluginStorage {
+                pool: value,
+                feed_root: PathBuf::new(),
+                signature_check: false,
+            }
+        }
+    }
+
+    async fn create_pool() -> anyhow::Result<(Config, SqlitePool)> {
         let nasl = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/feed/nasl").into();
         let notus = concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -284,31 +351,20 @@ mod tests {
             notus,
             ..Default::default()
         };
-        let pool = setup_sqlite(&config).await?;
+        let pool = sqlite::init(&config).await?;
 
         Ok((config, pool))
     }
 
     #[tokio::test]
-    async fn get_oids() -> crate::Result<()> {
+    async fn get_oids() -> anyhow::Result<()> {
         let (config, pool) = create_pool().await?;
         let feed_state = Arc::new(RwLock::new(FeedState::default()));
-        let endpoint = VTEndpoints::new(
-            SqlPluginStorage::from(pool.clone()),
-            feed_state.clone(),
-            None,
-        );
-        let synchronizer = FeedSynchronizer::new(pool.clone(), &config);
 
-        let oids = endpoint.get_oids("moep".into()).collect::<Vec<_>>().await;
-        assert_eq!(oids.len(), 1);
-        assert_eq!(
-            oids.into_iter()
-                .filter_map(|x| x.err())
-                .filter(|x| matches!(x, GetVTsError::NotYetAvailable))
-                .count(),
-            1
-        );
+        let synchronizer = FeedSynchronizer::new(pool.clone(), &config);
+        let feed = Feed::new(SqlPluginStorage::from(pool.clone()), feed_state.clone());
+
+        assert!(matches!(feed.get_oids(), Err(ApiError::FeedNotSynced)));
 
         orchestrator::test::verify_allowed_for(
             synchronizer,
@@ -319,11 +375,11 @@ mod tests {
 
         // in the case that examples are changed, I don't want to change this test each time hence
         // we just verify if we got oids.
-        let oids = endpoint.get_oids("moep".into()).collect::<Vec<_>>().await;
+        let oids = feed.get_oids()?.collect::<Vec<_>>().await;
         let oids = oids.into_iter().filter_map(|x| x.ok()).collect::<Vec<_>>();
         assert!(!oids.is_empty());
 
-        let vts = endpoint.get_vts("moep".into()).collect::<Vec<_>>().await;
+        let vts = feed.get_vts()?.collect::<Vec<_>>().await;
         let vts = vts.into_iter().filter_map(|x| x.ok()).collect::<Vec<_>>();
         assert!(!vts.is_empty());
         Ok(())

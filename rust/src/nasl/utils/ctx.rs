@@ -6,6 +6,7 @@
 
 use crate::models::{AliveTestMethods, Port, Protocol, ScanPreference};
 use crate::nasl::utils::indexed_arena::{ArenaIndex, IndexedArena};
+use crate::nasl::utils::mtime::MtimeCheck;
 use async_trait::async_trait;
 use rand::seq::IndexedRandom;
 use tokio::sync::RwLock;
@@ -25,6 +26,7 @@ use crate::storage::items::result::{ResultContextKeySingle, ResultItem};
 use crate::storage::{self, ScanID};
 use crate::storage::{Dispatcher, Remover, Retriever};
 use std::collections::BTreeSet;
+use std::path::Path;
 use std::sync::{Arc, MutexGuard};
 
 use super::error::ReturnBehavior;
@@ -238,6 +240,7 @@ impl CtxTarget {
 pub trait ContextStorage:
     Sync
     + Send
+    + MtimeCheck
     // kb
     + Dispatcher<KbContextKey, Item = KbItem>
     + Retriever<KbContextKey, Item = Vec<KbItem>>
@@ -259,12 +262,12 @@ pub trait ContextStorage:
         self.remove(&key).await?;
         self.dispatch(key, item).await
     }
-
 }
 
 impl<T> ContextStorage for T where
     T: Sync
         + Send
+        + MtimeCheck
         // kb
         + Dispatcher<KbContextKey, Item = KbItem>
         + Retriever<KbContextKey, Item = Vec<KbItem>>
@@ -703,6 +706,11 @@ impl<'a> ScriptCtx<'a> {
             target_id: self.target_id,
             vt: self.vt.clone(),
         }
+    }
+
+    pub(crate) fn cwd(&self) -> &Path {
+        let path = Path::new(&self.vt.filename);
+        path.parent().unwrap_or(Path::new("."))
     }
 }
 

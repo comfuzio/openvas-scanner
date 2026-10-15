@@ -1,16 +1,17 @@
-use std::{fs, path::PathBuf, task::Poll, time::UNIX_EPOCH};
+use std::{path::PathBuf, task::Poll};
 
-use crate::greenbone_scanner_framework::{GetVTsError, StreamResult};
+use crate::api::stream::StreamResult;
 use futures::Stream;
 use scannerlib::{
     models::{FeedType, VTData},
+    nasl::utils::mtime,
     storage::redis::{CACHE_KEY, DbError, NOTUS_KEY, RedisCtx},
 };
 
 use crate::{
     config::Config,
     vts::{
-        FeedHash, PluginFetcher, PluginStorer, error_vts_error,
+        FeedHash, PluginFetcher, PluginStorer,
         orchestrator::{self, WorkerError},
     },
 };
@@ -42,15 +43,13 @@ impl FeedSynchronizer {
     }
 }
 
-type R<T> = Result<T, GetVTsError>;
-
-fn init_redis_storage(redis_url: &str, ft: FeedType) -> R<RedisCtx> {
+fn init_redis_storage(redis_url: &str, ft: FeedType) -> Result<RedisCtx, WorkerError> {
     use scannerlib::storage::redis::*;
     let selector = match ft {
         FeedType::Products | FeedType::Advisories => NOTUSUPDATE_SELECTOR,
         FeedType::NASL => FEEDUPDATE_SELECTOR,
     };
-    RedisCtx::open(redis_url, selector).map_err(error_vts_error)
+    RedisCtx::open(redis_url, selector).map_err(|e| WorkerError::Sync(Box::new(e)))
 }
 
 #[derive(Debug, Clone)]
@@ -66,7 +65,7 @@ impl RedisPluginHandler {
 }
 
 fn redis_error_to_worker_error(error: DbError) -> WorkerError {
-    WorkerError::Sync(GetVTsError::External(Box::new(error)))
+    WorkerError::Sync(Box::new(error))
 }
 
 fn redis_with_hash<T, F>(
@@ -214,7 +213,7 @@ impl RedisVTDataStream {
                 Ok(x) => x.map(Ok),
                 Err(error) => Some(Err(redis_error_to_worker_error(error))),
             },
-            Err(error) => Some(Err(error.into())),
+            Err(error) => Some(Err(error)),
         }
     }
 
@@ -228,7 +227,7 @@ impl RedisVTDataStream {
                 Ok(x) => x.map(Ok),
                 Err(error) => Some(Err(redis_error_to_worker_error(error))),
             },
-            Err(error) => Some(Err(error.into())),
+            Err(error) => Some(Err(error)),
         }
     }
 }
@@ -310,22 +309,11 @@ impl PluginStorer for RedisPluginHandler {
                                 // if the verification was successful, we calculate now the mtime
                                 // otherwise we avoid to store it
                                 let hashsum: String = plugin.hashsum().into();
-                                let mtime = if !hashsum.is_empty() {
-                                    let mut file = feed_path;
-                                    file.push(vt.filename.clone());
-                                    fs::metadata(&file)
-                                        .unwrap_or_else(|_| {
-                                            panic!("File Metadata {:?}", file.to_string_lossy())
-                                        })
-                                        .modified()
-                                        .expect("File mtime not supported")
-                                        .duration_since(UNIX_EPOCH)
-                                        .expect("invalid duration for mtime")
-                                        .as_secs()
-                                        .to_string()
-                                } else {
-                                    String::new()
-                                };
+                                let mtime = mtime::compute_mtime(
+                                    &feed_path.clone().join(&vt.filename),
+                                    Some(&hashsum),
+                                )?
+                                .to_string();
                                 rctx.redis_add_nvt(vt, mtime, hashsum)
                             }
                         }
