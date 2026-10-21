@@ -5,13 +5,17 @@
 //! This crate is used to load NASL code based on a name.
 
 use std::{
-    collections::HashMap,
     fs::{self, File},
     io::{self, BufRead},
     path::{Path, PathBuf},
 };
 
+#[cfg(test)]
+use std::collections::HashMap;
+
 use thiserror::Error;
+
+use super::grammar::IncludeString;
 
 /// Defines abstract Loader error cases
 #[derive(Clone, Debug, PartialEq, Eq, Error)]
@@ -86,17 +90,12 @@ where
 {
     match fs::read_to_string(path) {
         Ok(x) => Ok(x),
-        Err(err) => {
+        Err(err) if err.kind() == io::ErrorKind::InvalidData => {
             // `InvalidData` means the file could be read but is not valid UTF-8
             // (some VTs are still stored as latin-1).
-            if err.kind() == io::ErrorKind::InvalidData {
-                tracing::warn!(
-                    file = %path.as_ref().display(),
-                    "File is not valid UTF-8; falling back to latin-1 decoding."
-                );
-            }
             read_non_utf8_path(path)
         }
+        Err(err) => Err(LoadError::from_io(path.as_ref(), err)),
     }
 }
 
@@ -132,6 +131,30 @@ pub struct Loader {
     loader: Box<dyn NaslLoader>,
 }
 
+#[derive(Clone, Debug)]
+pub struct LoadedFile {
+    path: PathBuf,
+    contents: String,
+}
+
+impl LoadedFile {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn contents(&self) -> &str {
+        &self.contents
+    }
+
+    pub fn into_contents(self) -> String {
+        self.contents
+    }
+
+    pub(crate) fn parts(self) -> (PathBuf, String) {
+        (self.path, self.contents)
+    }
+}
+
 impl Loader {
     /// Create a new loader that loads files from the file system
     /// relative to the given feed path.
@@ -147,32 +170,62 @@ impl Loader {
 
     /// Create an empty loader that returns a `LoadError::NotFound`
     /// for any given filename.
-    pub fn test_empty() -> Self {
+    #[cfg(test)]
+    pub(crate) fn test_empty() -> Self {
         Self::test().build()
     }
 
     /// Create a test loader. Test files can be added with the
     /// `.with_file` method and the result turned into a `Loader`
     /// with `.build()`.
-    ///
-    /// Example:
-    ///
-    /// ```
-    /// # use scannerlib::nasl::Loader;
-    /// Loader::test()
-    ///     .with_file("foo.nasl", "display('hello world')".into())
-    ///     .build();
-    /// ```
-    pub fn test() -> TestLoader {
+    #[cfg(test)]
+    pub(crate) fn test() -> TestLoader {
         TestLoader {
             files: HashMap::new(),
             root: None,
         }
     }
 
-    pub fn load(&self, file: impl AsRef<Path>) -> Result<String, LoadError> {
+    pub fn load(&self, file: impl AsRef<Path>) -> Result<LoadedFile, LoadError> {
         let path = file.as_ref();
-        self.loader.load(path)
+        Ok(LoadedFile {
+            path: path.to_owned(),
+            contents: self.loader.load(path)?,
+        })
+    }
+
+    /// Resolve the `include(include_name)` statement from `including_file`,
+    /// return the loaded file.
+    pub fn load_include(
+        &self,
+        including_file: impl AsRef<Path>,
+        include_name: &IncludeString,
+    ) -> Result<LoadedFile, LoadError> {
+        self.load_include_path(including_file, include_name.as_path())
+    }
+
+    fn load_include_path(
+        &self,
+        including_file: impl AsRef<Path>,
+        include_name: impl AsRef<Path>,
+    ) -> Result<LoadedFile, LoadError> {
+        // Includes are weirdly defined - we first look at
+        // a file in the same directory and use it if it
+        // exists, otherwise we check from the feed root
+        let include_name = include_name.as_ref();
+        let in_same_directory = including_file
+            .as_ref()
+            .parent()
+            .unwrap_or(Path::new(""))
+            .join(include_name);
+        match self.load(&in_same_directory) {
+            Err(err)
+                if err.kind() == &LoadErrorKind::NotFound && in_same_directory != include_name =>
+            {
+                self.load(include_name)
+            }
+            result => result,
+        }
     }
 
     pub fn root_path(&self) -> &Path {
@@ -201,7 +254,8 @@ struct FileSystemLoader {
 impl NaslLoader for FileSystemLoader {
     fn load(&self, filename: &Path) -> Result<String, LoadError> {
         let path = self.root.join(filename);
-        if !path.is_file() {
+        let metadata = fs::metadata(&path).map_err(|err| LoadError::from_io(&path, err))?;
+        if !metadata.is_file() {
             return Err(LoadError::not_a_file(path));
         }
         // unfortunately nasl is still in iso-8859-1
@@ -215,7 +269,8 @@ impl NaslLoader for FileSystemLoader {
 
     fn as_bufreader(&self, filename: &Path) -> Result<Box<dyn BufRead>, LoadError> {
         let path = self.root.join(filename);
-        if !path.is_file() {
+        let metadata = fs::metadata(&path).map_err(|err| LoadError::from_io(&path, err))?;
+        if !metadata.is_file() {
             return Err(LoadError::not_a_file(path));
         }
         match File::open(&path).map_err(|e| LoadError::from_io(path, e)) {
@@ -225,12 +280,14 @@ impl NaslLoader for FileSystemLoader {
     }
 }
 
+#[cfg(test)]
 #[derive(Clone)]
-pub struct TestLoader {
+pub(crate) struct TestLoader {
     files: HashMap<PathBuf, String>,
     root: Option<PathBuf>,
 }
 
+#[cfg(test)]
 impl NaslLoader for TestLoader {
     fn load(&self, path: &Path) -> Result<String, LoadError> {
         Ok(self
@@ -249,14 +306,15 @@ impl NaslLoader for TestLoader {
     }
 }
 
+#[cfg(test)]
 impl TestLoader {
-    pub fn build(self) -> Loader {
+    pub(crate) fn build(self) -> Loader {
         Loader {
             loader: Box::new(self),
         }
     }
 
-    pub fn with_file(mut self, file_name: &str, contents: String) -> Self {
+    pub(crate) fn with_file(mut self, file_name: &str, contents: String) -> Self {
         self.files.insert(file_name.into(), contents);
         self
     }
@@ -296,6 +354,42 @@ mod tests {
     use std::io::Write;
 
     use super::*;
+
+    #[test]
+    fn include_checks_files_in_right_order() {
+        let loader = Loader::test()
+            .with_file("sub/helper.inc", "local".into())
+            .with_file("helper.inc", "root".into())
+            .build();
+
+        let include = IncludeString::new("helper.inc".into());
+        let local = loader.load_include("sub/main.nasl", &include).unwrap();
+        assert_eq!(local.path(), Path::new("sub/helper.inc"));
+        assert_eq!(local.contents(), "local");
+
+        let root = loader
+            .load_include_path("other/main.nasl", "helper.inc")
+            .unwrap();
+        assert_eq!(root.path(), Path::new("helper.inc"));
+        assert_eq!(root.contents(), "root");
+    }
+
+    #[test]
+    fn nested_include_uses_the_loaded_file_path() {
+        let loader = Loader::test()
+            .with_file("lib/first.inc", "".into())
+            .with_file("lib/second.inc", "nested".into())
+            .build();
+        let first = loader
+            .load_include_path("sub/main.nasl", "lib/first.inc")
+            .unwrap();
+
+        let second = loader
+            .load_include_path(first.path(), "second.inc")
+            .unwrap();
+        assert_eq!(second.path(), Path::new("lib/second.inc"));
+        assert_eq!(second.contents(), "nested");
+    }
 
     #[test]
     fn reads_utf8_file_as_is() {
